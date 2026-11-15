@@ -1,0 +1,31 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH --time=24:00:00             # limit of wall clock time - how long the job will run (same as -t)
+#SBATCH --ntasks=1                  # number of tasks - how many tasks (nodes) that you require (same as -n)
+#SBATCH --cpus-per-task=128           # number of CPUs (or cores) per task (same as -c)
+#SBATCH --mem=2000GB                    # memory required per node - amount of memory (in bytes)
+#SBATCH --job-name RUN_IQTREE_GCF_CONCORD      # you can give your job a name for easier identification (same as -J)
+#SBATCH -A data-machine
+########## Command Lines to Run ##########
+cd $root
+
+source $root/config.env
+
+MYNAME=$(whoami)
+
+outdir=${root}/output_data/04_Phylogenomics/
+
+mkdir -p ${outdir}
+
+OUTROOT=${snps_only_vcf%".vcf.gz"}
+
+indir=${root}/output_data/04_Phylogenomics/extracted_complete_alignments/
+outdir=${root}/output_data/04_Phylogenomics/
+
+echo singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $indir:/in_dir ${gwas_tools_image} /iqtree/iqtree2 -te /out_dir/pkings_iqtree_genes_astral --gcf /out_dir/pkings_iqtree_genes.treefile --scf 100 -S /in_dir --prefix /out_dir/pkings_iqtree_genes_astral_gcf_scf_tree -T 128
+singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $indir:/in_dir ${gwas_tools_image} /iqtree/iqtree2 -te /out_dir/pkings_iqtree_genes_astral --gcf /out_dir/pkings_iqtree_genes.treefile --scf 100 -S /in_dir --prefix /out_dir/pkings_iqtree_genes_astral_gcf_scf_tree -T 128
+
+#echo singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $indir:/in_dir ${gwas_tools_image} /iqtree/iqtree2 -te /out_dir/pkings_iqtree_genes_astral -S /in_dir --scfl 100 --prefix /out_dir/pkings_iqtree_genes_astral_scf_tree -T 128
+#singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $indir:/in_dir ${gwas_tools_image} /iqtree/iqtree2 -te /out_dir/pkings_iqtree_genes_astral -S /in_dir --scfl 100 --prefix /out_dir/pkings_iqtree_genes_astral_scf_tree -T 128

@@ -1,0 +1,27 @@
+#!/bin/bash --login
+#SBATCH --time=03:59:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=6G
+#SBATCH --array=0-83%60
+#SBATCH --job-name=ld_decay
+
+## 23b_sim_ld_decay.sb
+## LD-decay test, step 1: simulated LD decay for the r/mu fit. One array task per (history, r/mu): the seven admissible
+## A1w histories x 12 ratios, 100 one-Mb replicates each, mu = 1e-8 arm of params.json (r/mu alone sets the
+## linkage at a fixed fitted theta, so one mu arm suffices).
+##
+## W is the work directory holding params.json (run_all.sh setup writes it); root is the repository root.
+## Usage (from the repository root; the job runs in W, which needs a logs/ subdirectory):
+##   sbatch -D "${W}" --export=ALL,root=$(pwd),W="${W}",MSPRIME_PYTHON=<python with msprime> -o logs/ld_decay_%A_%a.log \
+##     code/11_Drift_vs_Selection/simulation/23b_sim_ld_decay.sb
+
+PY=${MSPRIME_PYTHON:-python3}
+S=${root:?set root to the repository root}/code/11_Drift_vs_Selection/simulation
+MODELS=(M0 M0f M1f M2 M2f M3 M3f)
+RATIOS=(0.25 0.5 0.75 1 1.5 2 2.5 3 4 5 7.5 10)
+i=${SLURM_ARRAY_TASK_ID}
+m=${MODELS[$((i / 12))]}
+r=${RATIOS[$((i % 12))]}
+mkdir -p ${W}/ld_sim
+${PY} ${S}/23b_sim_ld_decay.py ${W}/params.json ${m} 1e-08 ${r} 100 ${W}/ld_sim/ld_${m}_${r}.tsv

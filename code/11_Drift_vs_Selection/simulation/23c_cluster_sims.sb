@@ -1,0 +1,29 @@
+#!/bin/bash --login
+#SBATCH --time=03:59:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=6G
+#SBATCH --array=0-41
+#SBATCH --job-name=ld_cluster
+
+## 23c_cluster_sims.sb
+## LD-decay test: the matched-window clustering null rerun at a chosen r, with 04c_worker_msprime_agree.py unchanged.
+## One array task per (history, task id): 7 histories x 6 tasks, mu = 1e-8 arm, 2-Mb chunks until BUDGET seconds.
+## Each history has its own directory ${W}/cluster/${ARM}/${model}/ holding a params.json whose r_rate is that
+## arm's r (23c_make_arm.py writes them). TASK_BASE keeps the seeds of different arms apart: 04c's seed depends on
+## (model, mu, task id) but not on r.
+##
+## Usage (from the repository root; the job runs in W, which needs a logs/ subdirectory):
+##   sbatch -D "${W}" --export=ALL,root=$(pwd),W="${W}",ARM=ctrl_r1,TASK_BASE=1,MSPRIME_PYTHON=<python with msprime> \
+##     -o logs/ld_cluster_%A_%a.log code/11_Drift_vs_Selection/simulation/23c_cluster_sims.sb
+
+PY=${MSPRIME_PYTHON:-python3}
+S=${root:?set root to the repository root}/code/11_Drift_vs_Selection/simulation
+BUDGET=${BUDGET:-12600}
+MODELS=(M0 M0f M1f M2 M2f M3 M3f)
+i=${SLURM_ARRAY_TASK_ID}
+m=${MODELS[$((i / 6))]}
+t=$((TASK_BASE + i % 6))
+D=${W}/cluster/${ARM}/${m}
+mkdir -p ${D}/chunks ${D}/joint ${D}/pos
+${PY} ${S}/04c_worker_msprime_agree.py ${m} 1e-08 ${t} ${BUDGET} ${D}

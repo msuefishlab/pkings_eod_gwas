@@ -1,0 +1,8 @@
+# Derived from the project's images/DsuiteDocker (tag dsuite_local), for Apple-silicon (aarch64) Docker.
+# Dsuite parses options with `for (char c; (c = getopt_long(...)) != -1;)`. char is unsigned on aarch64, so the loop
+# never ends and every Dsuite command hangs at 100% CPU. -fsigned-char gives x86 char semantics; the source is
+# unchanged. Commit pinned to a547f99 (0.5 r58 + an #include fix).
+FROM dsuite_local
+RUN cd /opt/Dsuite && git checkout a547f99599d763c1760548191ea3f62cc58e8ac3 && \
+	rm -f Build/*.o Build/Dsuite && \
+	make CXXFLAGS="-std=c++11 -fsigned-char"

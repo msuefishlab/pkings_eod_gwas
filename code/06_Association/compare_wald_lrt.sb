@@ -1,0 +1,36 @@
+#!/bin/bash --login
+# Wald vs LRT comparison for PKINGS_ALL_WOB_EXCLUDED; see compare_wald_lrt.R.
+# Run after both reports are rendered (06_Render_GWAS_report.sh ... wald / ... lrt), from the repo root:
+#   sbatch code/06_Association/compare_wald_lrt.sb
+# Expects output_data/06_Association/WALD_VS_LRT/published_{PEAKS.bed,min.txt} copied from the main (unphased LRT) run,
+# because the phased Wald run uses the same PKINGS_ALL_WOB_EXCLUDED directory (see README).
+#SBATCH --job-name=compare_wald_lrt
+#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH -o compare_wald_lrt_%j.out
+
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+cd $root
+source $root/config.env
+
+assoc_dir=${root}/output_data/06_Association
+outdir=${assoc_dir}/WALD_VS_LRT
+mkdir -p ${outdir}
+
+# genome-wide min p of one permutation, keyed by its permuted phenotype (phenotypes-N) so the tests pair up
+min_p() {
+	local log=$1 id
+	id=$(grep -o "phenotypes-[0-9]*" $log | head -1 | cut -d- -f2)
+	[ -n "$id" ] || return 0   # kinship and observed-phenotype runs have no phenotypes-N
+	awk -v id=$id 'NR==1 { for (i = 1; i <= NF; i++) if ($i == "p_wald" || $i == "p_lrt") pcol = i; next }
+	     $pcol ~ /^[0-9.eE+-]+$/ && (!found || $pcol + 0 < min) { min = $pcol + 0; found = 1 }
+	     END { print id "\t" min }' ${log%.log.txt}.assoc.txt
+}
+export -f min_p
+
+ls ${assoc_dir}/PKINGS_ALL_WOB_EXCLUDED/PKINGS_ALL_WOB_EXCLUDED_permution/*.log.txt | xargs -P 8 -I{} bash -c 'min_p {}' | sort -n > ${outdir}/wald_perm_min.tsv
+ls ${assoc_dir}/PKINGS_ALL_WOB_EXCLUDED_LRT/PKINGS_ALL_WOB_EXCLUDED_LRT_permution/*.log.txt | xargs -P 8 -I{} bash -c 'min_p {}' | sort -n > ${outdir}/lrt_perm_min.tsv
+
+singularity exec ${gwas_tools_image} Rscript ${root}/code/06_Association/compare_wald_lrt.R ${outdir}

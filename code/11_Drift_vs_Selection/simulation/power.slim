@@ -1,0 +1,56 @@
+// Peaks 4/5 selection power grid under the fitted A1w history (rescaled by Q).
+// Constants via -d: NBP NTP MBP MTP S H F0 TEND NSBP NSTP REP
+initialize() {
+    initializeSLiMModelType("WF");
+    initializeMutationRate(0);
+    initializeMutationType("m2", asFloat(H), "f", asFloat(S));
+    m2.convertToSubstitution = F;
+    initializeGenomicElementType("g1", m2, 1.0);
+    initializeGenomicElement(g1, 0, 0);
+    initializeRecombinationRate(0);
+}
+mutationEffect(m2, p2) {
+    // selection is BP-specific: SELTP = 0 -> neutral in TP; SELTP < 0 -> divergent selection
+    if (asFloat(SELTP) == 0.0) return 1.0;
+    if (homozygous) return 1.0 + asFloat(SELTP);
+    return 1.0 + asFloat(H) * asFloat(SELTP);
+}
+1 early() {
+    sim.addSubpop("p1", NBP);
+    sim.addSubpop("p2", NTP);
+    p1.setMigrationRates(p2, asFloat(MBP));
+    p2.setMigrationRates(p1, asFloat(MTP));
+}
+1 late() {
+    hs = p1.haplosomes;
+    n = asInteger(round(asFloat(F0) * size(hs)));
+    if (n < 1) n = 1;
+    sample(hs, n).addNewDrawnMutation(m2, 0);
+    community.rescheduleScriptBlock(s1, TEND, TEND);
+}
+s1 999999 late() {
+    muts = sim.mutationsOfType(m2);
+    f1 = 0.0; f2 = 0.0;
+    if (size(muts) > 0) {
+        f1 = sim.mutationFrequencies(p1, muts)[0];
+        f2 = sim.mutationFrequencies(p2, muts)[0];
+    }
+    s1i = sample(p1.individuals, NSBP);
+    s2i = sample(p2.individuals, NSTP);
+    d1 = 0; h1 = 0;
+    for (ind in s1i) {
+        cnt = sum(ind.haplosomes.countOfMutationsOfType(m2));
+        d1 = d1 + cnt;
+        if (cnt == 1) h1 = h1 + 1;
+    }
+    d2 = 0; h2 = 0;
+    for (ind in s2i) {
+        cnt = sum(ind.haplosomes.countOfMutationsOfType(m2));
+        d2 = d2 + cnt;
+        if (cnt == 1) h2 = h2 + 1;
+    }
+    catn("RESULT\t" + S + "\t" + H + "\t" + F0 + "\t" + (TEND - 1) + "\t" + REP + "\t" +
+         f1 + "\t" + f2 + "\t" + d1 + "\t" + h1 + "\t" + d2 + "\t" + h2 + "\t" + size(muts) +
+         "\t" + community.tick + "\t" + SELTP);
+    sim.simulationFinished();
+}

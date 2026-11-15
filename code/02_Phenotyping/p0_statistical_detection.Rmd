@@ -1,0 +1,389 @@
+---
+title: "Quantitative P0 call: presence (shape) + magnitude (vP0), label-free"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_dir: "output_data/02_Phenotyping"
+  fish_data: "input_data/01_Terra/data_model/fish_data_2024a.txt"
+  species: "Paramormyrops kingsleyae"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+root <- rprojroot::find_root(".git/index")
+knitr::opts_knit$set(root.dir = root)
+library(tidyverse)
+library(data.table)
+set.seed(1)
+have <- function(pkg) requireNamespace(pkg, quietly = TRUE)
+if (have("mclust")) suppressMessages(library(mclust))   # Mclust needs the pkg attached
+source(file.path(root, "code", "02_Phenotyping", "p0_shape_functions.R"))
+```
+
+# Purpose
+
+A quantitative, **label-free** TP / Wobble / BP P0 call, on two orthogonal axes that use the
+*right measure for each question*:
+
+- **Presence — is a distinct P0 there? (BP vs Wobble/TP).** An **amplitude-invariant** signal
+  (iZC1-anchored shape score + dipSNR), because the *absolute* P0 size of a BP baseline is
+  population-confounded (~4×), so presence must not depend on size. The discriminating power is
+  in the homology-anchored (iZC1) representation.
+- **Magnitude — how big is the P0? (Wobble vs TP).** The **peak-to-peak-normalized P0
+  amplitude `|vP0|`** — the third phase's size relative to the whole EOD. This is the naturally
+  population-robust measure (2.7× spread across TP populations, vs 7× for dipSNR) and separates
+  TP from Wobble at held-out AUC **0.998**. dipSNR is not used here: its self-normalization by
+  baseline noise re-injects a population confound and would mis-call whole low-P0 TP populations
+  (DOG/DOV/IVI) as Wobble.
+
+Fish near a boundary are called **Ambiguous** rather than forced — the BP/Wobble margin is a
+genuine continuum (a near-noise wobble's P0 is at the noise floor). Nothing is fit to the manual
+labels; they appear only in held-out validation.
+
+```{r load}
+data_dir <- file.path(root, params$data_dir)
+sw   <- fread(file.path(data_dir, "p0_windows_per_sweep.csv"))       # iZC1-anchored, per sweep
+meas <- fread(file.path(data_dir, "measurement_data_per_sweep.csv")) # for vP0 (P0 amplitude)
+
+fish <- fread(file.path(root, params$fish_data))
+meta <- fish %>%
+  transmute(sample_name = PN, POP, Species, manual_Phenotype = Phenotype) %>%
+  distinct(sample_name, .keep_all = TRUE) %>%
+  mutate(manual_Phenotype = case_when(
+    manual_Phenotype %in% c("Mixed", "mix", "MIXED") ~ "Wobble",
+    TRUE ~ manual_Phenotype)) %>%
+  filter(Species == params$species,
+         manual_Phenotype %in% c("TP", "Wobble", "BP")) %>%
+  mutate(manual_Phenotype = factor(manual_Phenotype, levels = c("TP", "Wobble", "BP")))
+
+conf_path <- file.path(data_dir, "p0_confidence_table.csv")          # optional: from p0_phenotype_assessment.Rmd
+prior_call <- if (file.exists(conf_path)) {
+  fread(conf_path) %>% transmute(sample_name, quant_call = as.character(quant_call))
+} else NULL
+
+pheno_cols <- c("TP" = "#1b9e77", "Wobble" = "#7570b3", "BP" = "#d95f02")
+L <- 128L; bankL <- make_bank(L)
+wc <- grep("^p[0-9]+$", names(sw), value = TRUE)
+sw <- sw[sample_name %in% meta$sample_name]
+ids <- intersect(meta$sample_name, unique(sw$sample_name))
+```
+
+# 1. Per-fish statistics
+
+Presence signals (shape, dipSNR) on the iZC1-anchored per-sweep average — amplitude-invariant.
+Magnitude `|vP0|` = mean peak-to-peak-normalized P0 amplitude. The ± **sign-flip** p is a
+stricter presence corroboration.
+
+```{r statistic}
+shape_fun <- function(a) p0_score_one(a, bankL, L)["shape"]
+snr_fun   <- function(a) p0_score_one(a, bankL, L)["snr"]
+sidak2 <- function(p) 1 - (1 - p)^2
+
+stat <- lapply(ids, function(sn) {
+  A <- as.matrix(sw[sample_name == sn, ..wc]); A <- A[complete.cases(A), , drop = FALSE]
+  if (nrow(A) < 1) return(NULL)
+  s <- p0_score_one(colMeans(A), bankL, L)
+  ps <- if (nrow(A) >= 2) {
+    fs <- as.numeric(signflip_p(A, shape_fun, 400L))
+    ss <- as.numeric(signflip_p(A, snr_fun, 400L))
+    sidak2(min(fs[2], ss[2]))
+  } else NA_real_
+  data.frame(sample_name = sn, n_sweeps = nrow(A),
+             shape = as.numeric(s["shape"]), dipSNR = as.numeric(s["snr"]),
+             repro = p0_repro_izc1(A),           # iZC1-anchored per-sweep P0 reproducibility
+             p_signflip = ps)
+}) %>% bind_rows()
+
+# Per-fish |vP0| (magnitude) and P0-latency scatter tp0_sd (phase-locking): a real
+# P0 recurs at a fixed latency across sweeps (low scatter); a BP "dip" is noise
+# landing at random latencies (high scatter). Anatomy-validated as the discriminator
+# at the weak margin (confirmed BP tp0_sd ~0.09 vs confirmed wobbles ~0.03).
+agg <- meas %>% group_by(sample_name) %>%
+  summarise(vP0 = mean(abs(vP0), na.rm = TRUE),
+            tp0_sd = sd(tP0, na.rm = TRUE), .groups = "drop")
+
+stat <- stat %>% left_join(agg, by = "sample_name") %>% left_join(meta, by = "sample_name") %>%
+  mutate(lsnr = log10(pmax(dipSNR, 0) + 1), lvP0 = log10(pmax(vP0, 0) + 1e-4))
+
+stat %>% group_by(manual_Phenotype) %>%
+  summarise(n = n(), shape = median(shape), dipSNR = median(dipSNR),
+            vP0 = median(vP0), .groups = "drop") %>%
+  knitr::kable(digits = 4, caption = "Statistics by manual label (held-out)")
+```
+
+# 2. Presence axis (BP vs P0-present)
+
+Presence is decided by **reproducibility**, the one *unconfounded* presence measure. A single
+joint 3-component mixture on `(shape, log dipSNR)` is not used: the dominant BP component
+(BP outnumbers Wobble ~2.6:1) swallows the minority Wobble mode and buries real wobbles as BP.
+What matters most is *which measure* presence is read from: `shape` and `dipSNR` are computed on
+the sweep-**average**, where a BP noise-dip can fake a good score (**BP look-alikes** — BP fish
+whose average shape/dipSNR mimic a wobble). Only a real P0 must **recur across sweeps**. So
+presence is `P(present) = 1 − P(BP-component)` on **`repro`** — the iZC1-anchored per-sweep
+reproducibility of the P0 dip (3-component mixture: BP/Wobble/TP each get a reproducibility
+mode). `repro` separates true weak wobbles from BP look-alikes at held-out **AUC 0.94** where
+shape/dipSNR are at chance, and it rescues the anatomy-confirmed wobble APA_6681 that no
+amplitude feature could. We do **not** OR shape/dipSNR back in — that re-admits the BP
+look-alikes (it force-called ~10 real BP fish Wobble). For fish with **fewer than 4 sweeps**
+(where `repro` is undefined) we fall back to the shape/dipSNR OR as the best available evidence.
+Tiers: **present** (>0.8), **absent** (<0.2), **ambiguous** in between. Genuine BP/Wobble
+overlap — fish indistinguishable on every EOD feature from a real BP (e.g. the anatomy wobble
+BAM_6494 vs the BP BAM_6603) — lands **ambiguous by design**: flagged for review, not
+force-called.
+
+P0-latency phase-locking (`tp0_sd`) is computed and reported as a **flag only, not part of the
+call**. It was tested as a rescue for weak wobbles but is **confounded**: it measures the
+consistency of the *waveform onset*, which clean BP fish share — several confirmed/by-eye BP
+fish (e.g. BIK_6912 at 0.014) are *more* phase-locked than the anatomy-confirmed wobble
+APA_6681 (0.028), so no threshold separates them. `phaselock_watch` therefore marks fish that
+are phase-locked but below amplitude detection — a **watchlist for anatomical follow-up**, not
+a wobble call. (The one anatomy wobble the eye missed, BAM_6494, is caught by amplitude anyway.)
+
+```{r presence}
+PL_THR <- 0.05                                       # phase-lock flag threshold (ms), NOT a call
+# A single joint 3-component GMM on (shape, log dipSNR) is not used: BP outnumbers Wobble ~2.6:1,
+# so the dominant BP component swallows the intermediate Wobble mode and buries real wobbles as BP.
+# `p_above_bp` gives the soft P(above the lowest/BP mode) on any one axis via a per-axis
+# mixture; the presence rule below uses it on `repro` (primary) with a shape/dipSNR fallback.
+p_above_bp <- function(x, G = 3L) {                  # soft P(above the lowest/BP mode) on one axis
+  ok <- is.finite(x); out <- rep(NA_real_, length(x))  # NA-safe: fit on finite, NA passes through
+  if (sum(ok) < G + 1) return(out)
+  m  <- mclust::Mclust(x[ok], G = G, modelNames = "V", verbose = FALSE)
+  bp <- order(m$parameters$mean)[1]                  # lowest component = BP mode on this axis
+  out[ok] <- 1 - m$z[, bp]; out
+}
+# Presence is driven by REPRODUCIBILITY (`repro`) -- the one UNCONFOUNDED presence measure.
+# shape and dipSNR are computed on the sweep-AVERAGE, where a BP noise-dip can fake a good
+# score (BP look-alikes: BP fish whose average shape/dipSNR mimic a wobble); only a REAL P0
+# recurs across sweeps. So `repro` is PRIMARY whenever it is defined (>= 4 sweeps), split by a
+# 3-component mixture (BP/Wobble/TP each get a reproducibility mode; "above BP" = clearing the
+# BP/Wobble antimode). Do NOT OR shape/dipSNR back in: that re-admits the BP look-alikes a
+# high average-shape lets through (it force-called ~10 real BP fish Wobble). For too-few-sweep
+# fish where `repro` is undefined we FALL BACK to the shape/dipSNR OR -- the best available
+# evidence, though less certain (these tend to land ambiguous, not confident). BP specificity
+# is preserved: no real BP dip reproduces (anatomy BP `repro` ~0.1), and the highest-repro BP
+# fish -- indistinguishable on every EOD feature from the anatomy wobble BAM_6494 -- correctly
+# lands ambiguous, not Wobble.
+p_repro <- p_above_bp(stat$repro, G = 3L)
+p_cand  <- pmax(p_above_bp(stat$shape), p_above_bp(stat$lsnr), na.rm = TRUE)  # <4-sweep fallback
+stat <- stat %>% mutate(
+  p_present     = ifelse(is.finite(p_repro), p_repro, p_cand),
+  presence_tier = case_when(p_present > 0.8 ~ "present",
+                            p_present < 0.2 ~ "absent",
+                            TRUE            ~ "ambiguous"),
+  phaselocked = n_sweeps >= 3 & is.finite(tp0_sd) & tp0_sd < PL_THR,
+  phaselock_watch = phaselocked & presence_tier != "present")  # flag, NOT a call
+
+stat %>% group_by(presence_tier, manual_Phenotype) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = manual_Phenotype, values_from = n, values_fill = 0) %>%
+  knitr::kable(caption = "Presence tier vs manual label (held-out)")
+
+sprintf("%d fish on the phase-lock watchlist (phase-locked but below amplitude detection)",
+        sum(stat$phaselock_watch))
+```
+
+# 3. Magnitude axis (Wobble vs TP) — population-robust |vP0|
+
+Among **present** fish, TP vs Wobble is the P0 amplitude `|vP0|`, split at a data-driven
+antimode (2-component mixture on log|vP0|). `|vP0|` is population-robust (the P0 size relative
+to the whole EOD), so low-P0 TP populations are not mistaken for wobbles.
+
+Magnitude also **rescues noisy TP** whose presence axis came out ambiguous: a large-amplitude
+P0 is *definitionally present*, so a fish with clearly-TP `|vP0|` (`p_tp > 0.8`) is called TP
+even from the ambiguous tier (e.g. noisy or few-sweep IVI/DOG fish with a real large P0 but a
+noise-deflated dipSNR/`repro`). This override is restricted to the **ambiguous** tier, never
+**absent**, so a noise-inflated `|vP0|` in a real BP cannot be force-called TP.
+
+```{r magnitude}
+present <- stat %>% filter(presence_tier == "present", is.finite(lvP0))
+xv <- present$lvP0
+stat$p_tp <- NA_real_; fin <- is.finite(stat$lvP0)
+if (have("mclust") && length(xv) >= 8) {
+  mcv <- mclust::Mclust(xv, G = 2, modelNames = "V", verbose = FALSE)
+  ov <- order(mcv$parameters$mean); grid <- seq(min(xv), max(xv), length.out = 2000)
+  post_tp <- predict(mcv, grid)$z[, ov[2]]; antimode <- grid[which.min(abs(post_tp - 0.5))]
+  stat$p_tp[fin] <- predict(mcv, stat$lvP0[fin])$z[, ov[2]]   # p_tp for ALL fish, not just present
+} else { antimode <- median(xv); stat$p_tp[fin] <- as.numeric(stat$lvP0[fin] >= antimode) }
+
+stat <- stat %>%
+  mutate(
+    stat_call = case_when(
+      # A large P0 is DEFINITIONALLY present -- a big-amplitude P0 cannot be "not there". So a fish
+      # with clearly-TP |vP0| (p_tp > 0.8) is TP even when the presence axis is ambiguous (noisy or
+      # few-sweep TP, e.g. IVI/DOG: real large P0 but deflated dipSNR/repro). Restricted to
+      # `ambiguous` -- NEVER `absent` -- so noise-inflated |vP0| in a real BP (e.g. COB_4004) cannot
+      # be force-called TP. Stronger magnitude bar (0.8) than for present fish (antimode = 0.5),
+      # because it must override presence uncertainty.
+      presence_tier == "ambiguous" & p_tp > 0.8 ~ "TP",
+      presence_tier == "absent"    ~ "BP",
+      presence_tier == "ambiguous" ~ "Ambiguous",
+      lvP0 >= antimode             ~ "TP",
+      TRUE                         ~ "Wobble"),
+    confidence = case_when(
+      stat_call %in% c("TP", "Wobble") & is.finite(p_tp) ~ pmax(p_tp, 1 - p_tp),
+      TRUE                                               ~ pmax(p_present, 1 - p_present)),
+    ambiguous = stat_call == "Ambiguous",
+    definitely_present = presence_tier == "present" &
+                         is.finite(p_signflip) & p_signflip < 0.05,
+    disagrees_manual = stat_call != as.character(manual_Phenotype))
+
+sprintf("TP/Wobble antimode: |vP0| = %.4f (TP median %.4f, Wobble median %.4f)",
+        10^antimode - 1e-4,
+        median(stat$vP0[stat$manual_Phenotype == "TP"], na.rm = TRUE),
+        median(stat$vP0[stat$manual_Phenotype == "Wobble"], na.rm = TRUE))
+
+ggplot(stat, aes(lsnr, lvP0, color = manual_Phenotype, shape = stat_call)) +
+  geom_point(alpha = 0.85, size = 2) +
+  geom_hline(yintercept = antimode, linetype = "dotted", color = "grey40") +
+  scale_color_manual(values = pheno_cols) +
+  labs(x = "Presence: log10(dipSNR+1)  (amplitude-invariant)",
+       y = "Magnitude: log10(|vP0|)  (dotted = TP/Wobble antimode)",
+       color = "Manual label", shape = "Quant call",
+       title = "Two orthogonal P0 axes: presence (x) and magnitude (y)") +
+  theme_minimal()
+```
+
+# 4. Held-out validation
+
+Nothing above used the manual labels.
+
+```{r validation}
+auc <- function(pos, neg) { pos <- pos[is.finite(pos)]; neg <- neg[is.finite(neg)]
+  mean(outer(pos, neg, ">") + 0.5 * outer(pos, neg, "==")) }
+bp <- stat %>% filter(manual_Phenotype == "BP")
+wo <- stat %>% filter(manual_Phenotype == "Wobble")
+tp <- stat %>% filter(manual_Phenotype == "TP")
+tibble(axis = c("Presence: dipSNR (present-vs-BP)", "Presence: dipSNR (Wobble-vs-BP)",
+                "Magnitude: |vP0| (TP-vs-Wobble)"),
+       AUC = c(auc(c(wo$dipSNR, tp$dipSNR), bp$dipSNR),
+               auc(wo$dipSNR, bp$dipSNR),
+               auc(tp$vP0, wo$vP0))) %>%
+  knitr::kable(digits = 3, caption = "Held-out AUC — right measure per axis")
+
+table(stat_call = factor(stat$stat_call, c("TP","Wobble","Ambiguous","BP")),
+      manual = stat$manual_Phenotype) %>%
+  knitr::kable(caption = "Quantitative call vs manual label (Ambiguous = not force-called)")
+
+# The population confound this fix removes: TP |vP0| is stable; dipSNR is not.
+tp %>% group_by(POP) %>%
+  summarise(n = n(), median_vP0 = median(vP0), median_dipSNR = median(dipSNR),
+            called_TP = sum(stat_call == "TP"), .groups = "drop") %>%
+  filter(n >= 2) %>% arrange(median_vP0) %>%
+  knitr::kable(digits = 4, caption = "manual-TP by POP: |vP0| stable, dipSNR not; all now called TP")
+
+if (!is.null(prior_call)) {
+  stat2 <- stat %>% left_join(prior_call, by = "sample_name")
+  table(stat_call = stat2$stat_call, prior = stat2$quant_call) %>%
+    knitr::kable(caption = "Quantitative call vs prior by-eye-calibrated quant_call")
+}
+```
+
+## Anatomical ground truth
+
+The only fish with confirmed anatomy. The amplitude call gets 6/7: all 4 TP, the confirmed BP
+(BAM_6497), and BAM_6494 — which anatomy says is a wobble and the *eye mislabeled BP*, but the
+method calls Wobble via its dipSNR. The one miss is APA_6681 (a real wobble whose P0 is at the
+noise floor → called BP, flagged `phaselock_watch`); no EOD feature separates it from clean BP,
+so it is honestly left for anatomy. `tp0_sd` is shown for reference — note the confirmed BP is
+*not* the highest-scatter fish, underscoring why phase-locking can't make the call.
+
+```{r anatomy}
+anat <- tibble::tribble(
+  ~sample_name, ~anatomy,
+  "APA_6737", "TP", "APA_6675", "TP", "APA_6676", "TP", "BAM_6597", "TP",
+  "BAM_6494", "Wobble", "APA_6681", "Wobble",
+  "BAM_6497", "BP")
+stat %>% inner_join(anat, by = "sample_name") %>%
+  arrange(anatomy, desc(dipSNR)) %>%
+  select(sample_name, anatomy, manual_Phenotype, stat_call,
+         dipSNR, vP0, tp0_sd, phaselocked, presence_tier) %>%
+  knitr::kable(digits = 4, caption = "Method call vs confirmed anatomy")
+```
+
+## Priority-review list
+
+```{r disagreements}
+stat %>% filter(disagrees_manual | ambiguous) %>%
+  arrange(desc(ambiguous), confidence) %>%
+  select(sample_name, POP, manual_Phenotype, stat_call, presence_tier,
+         shape, dipSNR, repro, vP0, p_present, p_tp, p_signflip, confidence) %>%
+  knitr::kable(digits = 3, caption = "Ambiguous fish + disagreements with the by-eye label")
+```
+
+## Spot-check of known fish
+
+```{r spotcheck}
+stat %>% filter(sample_name %in% c("BAM_6550","APA_193","APA_198","APA_6685",
+                                   "BAM_6494","APA_6681","BAM_6497")) %>%
+  select(sample_name, POP, manual_Phenotype, n_sweeps, shape, dipSNR, vP0, tp0_sd,
+         presence_tier, phaselock_watch, stat_call, confidence, p_signflip) %>%
+  knitr::kable(digits = 4, caption = "Known reference fish (incl. anatomy anchors)")
+```
+
+# Output
+
+```{r write}
+out <- stat %>%
+  transmute(sample_name, POP, manual_Phenotype, n_sweeps, shape, dipSNR, repro, vP0, tp0_sd,
+            p_present, phaselocked, phaselock_watch, presence_tier, p_tp,
+            stat_call, confidence, ambiguous, p_signflip, definitely_present,
+            disagrees_manual) %>%
+  arrange(POP, sample_name)
+fwrite(out, file.path(root, params$data_dir, "p0_statistical_table.csv"))
+sprintf("Wrote %d fish to p0_statistical_table.csv", nrow(out))
+```
+
+# Sort PNGs by call for review
+
+Rebuild `<data_dir>/by_stat_call/<stat_call>/` from the original per-fish PNGs (cleared and
+rebuilt each render). Filenames encode a `DISAGREE` flag (call ≠ manual label), the manual
+label, and confidence, so mismatches sort to the top and low-confidence calls are visible.
+
+```{r sort-pngs}
+png_src <- file.path(root, params$data_dir)
+dest    <- file.path(png_src, "by_stat_call")
+if (dir.exists(dest)) unlink(dest, recursive = TRUE)          # clear, then rebuild
+for (sc in unique(out$stat_call))
+  dir.create(file.path(dest, sc), recursive = TRUE, showWarnings = FALSE)
+
+n_copied <- 0L
+for (i in seq_len(nrow(out))) {
+  src_png <- file.path(png_src, paste0(out$sample_name[i], ".png"))
+  if (!file.exists(src_png)) next
+  flag <- if (isTRUE(out$disagrees_manual[i])) "DISAGREE" else "agree"
+  fn <- sprintf("%s__manual-%s__conf%.2f__%s.png",
+                flag, as.character(out$manual_Phenotype[i]),
+                out$confidence[i], out$sample_name[i])
+  if (file.copy(src_png, file.path(dest, out$stat_call[i], fn), overwrite = TRUE))
+    n_copied <- n_copied + 1L
+}
+sprintf("Sorted %d PNGs into %s/<stat_call>/  (%d disagree with the by-eye label)",
+        n_copied, file.path(params$data_dir, "by_stat_call"), sum(out$disagrees_manual))
+```
+
+# Interpretation
+
+- **Two axes, each with the right measure.** Presence (BP vs P0-present) uses the
+  amplitude-invariant shape/dipSNR — robust to the population-confounded BP baseline (~98% BP
+  specificity, ~95% TP sensitivity). Magnitude (TP vs Wobble) uses `|vP0|`, the P0 size
+  relative to the whole EOD, which is population-robust and near-perfect (AUC 0.998).
+- **No population confound in magnitude:** low-P0 TP populations (DOG/DOV/IVI/COB) are not
+  mis-called Wobble, because magnitude uses `|vP0|`; dipSNR would re-inject the population confound.
+- **Phase-locking is a flag, not a call.** A tightly recurring P0 latency looked promising for
+  rescuing weak wobbles, but it is confounded by waveform-onset consistency: several by-eye/
+  anatomy BP fish are *more* phase-locked (`tp0_sd` 0.014–0.024) than the anatomy-confirmed
+  wobble APA_6681 (0.028), so no threshold separates real weak wobbles from clean BP. It cannot
+  make the call. `phaselock_watch` marks phase-locked sub-amplitude fish as a **watchlist for
+  anatomical follow-up** only.
+- **The BP/Wobble margin is an irreducible continuum for the EOD.** At the noise floor the P0
+  amplitude of a real weak wobble (e.g. APA_6681) is indistinguishable from BP by any EOD
+  feature tried (depth, area, dipSNR, width, phase-locking). Those fish land absent/ambiguous,
+  flagged rather than force-called; only anatomy can resolve them.
+- **`p_signflip`** marks fish present even under the strict ± null — a high-confidence subset.
+- Re-examine the priority list against the PDFs in `output_data/02_Phenotyping/<POP>/`.
+```

@@ -1,0 +1,41 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH --time=03:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4g
+#SBATCH -J power_sim
+########## Command Lines to Run ##########
+
+# Tests each planted SNP from 11_power_sim_make.R with GEMMA (Wald, real BAM
+# kinship). Array task t handles sims (t-1)*CHUNK+1 .. t*CHUNK.
+# Expects exported: root, CHUNK.
+
+cd $root
+source $root/config.env
+
+simdir=${root}/output_data/14_Wobble_Analysis/BAM_P0/POWER_SIM
+kin=${root}/output_data/06_Association/BAM_ONLY_BP0_TPWOB1/BAM_ONLY_BP0_TPWOB1.relate.cXX.txt
+tmp=${TMPDIR:-/tmp}/psim_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}
+mkdir -p ${simdir}/results ${tmp}
+
+first=$(( (SLURM_ARRAY_TASK_ID - 1) * CHUNK + 1 ))
+nsim=$(wc -l < ${simdir}/sim_geno.txt)
+last=$(( first + CHUNK - 1 )); [ ${last} -gt ${nsim} ] && last=${nsim}
+out=${simdir}/results/chunk_${SLURM_ARRAY_TASK_ID}.tsv
+
+singularity exec --bind ${root}:${root} --bind ${tmp}:${tmp} ${gwas_tools_image} bash -c "
+  : > ${out}
+  for i in \$(seq ${first} ${last}); do
+    sed -n \"\${i}p\" ${simdir}/sim_geno.txt > ${tmp}/g.txt
+    cut -f\${i} ${simdir}/sim_pheno.tsv > ${tmp}/p.txt
+    /gemma/GEMMA/bin/gemma -g ${tmp}/g.txt -p ${tmp}/p.txt -k ${kin} \
+      -lmm 1 -maf 0.01 -outdir ${tmp} -o s > /dev/null 2>&1
+    # p_wald is the last column; sim_id is the rs prefix before ':'
+    awk -v i=\${i} 'NR==2{split(\$2,a,\":\"); print a[1]\"\t\"\$NF}' ${tmp}/s.assoc.txt >> ${out}
+    rm -f ${tmp}/s.assoc.txt
+  done
+"
+rm -rf ${tmp}

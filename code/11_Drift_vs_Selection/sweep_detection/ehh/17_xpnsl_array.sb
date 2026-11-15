@@ -1,0 +1,32 @@
+#!/bin/bash
+#SBATCH --job-name=xpnsl
+#SBATCH --array=0-74
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=12G
+#SBATCH --time=03:59:00
+#SBATCH --output=output_data/slurm_logs/11_Drift_vs_Selection/xpnsl_%A_%a.out
+## XP-nSL per contrast x chromosome (the XP-nSL sensitivity row of Table S5): 3 pairs x 25 chromosomes, same inputs as
+## 14_ehh_scan_array.sb. Then run 17b_xpnsl_merge.py once all 75 tasks are done.
+##   sbatch --export=root=$(pwd) code/11_Drift_vs_Selection/sweep_detection/ehh/17_xpnsl_array.sb
+
+set -euo pipefail
+source "${root}/config.env"
+
+pairs=(BP1_TP1 BP2_TP2 BP3_TP2)
+pair="${pairs[$((SLURM_ARRAY_TASK_ID / 25))]}"
+chrom="chr$(((SLURM_ARRAY_TASK_ID % 25) + 1))"
+bp="${pair%%_*}"; tp="${pair##*_}"
+
+sd=output_data/11_Drift_vs_Selection/sweep_detection
+vcf="${sd}/by_chrom/${pair}.polarized.${chrom}.vcf.gz"
+raw_dir="${sd}/ehh/xpnsl_raw"
+out="${raw_dir}/${pair}.${chrom}.xpnsl_raw.tsv.gz"
+mkdir -p "${root}/${raw_dir}"
+if [[ -s "${root}/${out}" ]]; then echo "already done: ${out}"; exit 0; fi
+
+singularity exec --bind "${scratch_dir}" --bind "${root}:/project_root" "${dadi_image}" \
+  python3 /project_root/code/11_Drift_vs_Selection/sweep_detection/ehh/17_xpnsl.py \
+  --vcf "/project_root/${vcf}" \
+  --bp-list "/project_root/input_data/11_Drift_vs_Selection/sweep_detection/split_up/${bp}.txt" \
+  --tp-list "/project_root/input_data/11_Drift_vs_Selection/sweep_detection/split_up/${tp}.txt" \
+  --chrom "${chrom}" --out "/project_root/${out}"

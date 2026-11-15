@@ -1,0 +1,130 @@
+---
+title: "Examination of Signatures of Introgression with DSuite"
+output: html_notebook
+---
+
+Peak-level Patterson's D (ABBA-BABA) and f4-ratio at the six GWAS peaks, compared with the genome-wide value for the
+same trio (Fig. S5, Table S4).
+
+- Inputs are Dsuite `Dtrios -t pops.tree` outputs. The `_tree.txt` files list P1 and P2 as sisters on the species tree
+  and order them so that D >= 0, so the sign is carried by which of P1/P2 is listed second.
+- Each hypothesis is one trio (focal, sister; P3). D is re-oriented so that D > 0 means excess allele sharing between
+  the focal lineage and P3, and D < 0 means excess sharing between its sister and P3.
+- Peak windows are the extended peaks in `input_data/10_Introgression/peaks.bed` (−log10 p > 3 merged within 75 kb), run by
+  `03_submit_dsuite_peaks.sh` into `output_data/10_Introgression/peaks_extended/`.
+- Genome-wide values are `whole_genome_combined_tree.txt`, the Dtrios counts of all 25 chromosomes combined.
+
+```{r setup}
+root <- rprojroot::find_root(".git/index")
+knitr::opts_knit$set(root.dir = root)
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+
+intro_dir <- file.path(root, "output_data", "10_Introgression")
+peak_dir  <- file.path(intro_dir, "peaks_extended")
+fig_dir   <- file.path(intro_dir, "figures")
+dir.create(fig_dir, showWarnings = FALSE)
+
+read_dsuite <- function(f, peak_label = NA_character_) {
+  df <- read_tsv(f, show_col_types = FALSE, progress = FALSE)
+  # 1:P1 2:P2 3:P3 4:D 5:Z 6:p 7:f4ratio 8:BBAA 9:ABBA 10:BABA
+  names(df)[1:10] <- c("P1","P2","P3","D","Z","p","f4ratio","BBAA","ABBA","BABA")
+  df %>% mutate(Peak = peak_label)
+}
+
+# One trio per hypothesis: focal and sister are sisters on the tree, P3 is the lineage tested for sharing with focal.
+hyp_defs <- tribble(
+  ~Hypothesis,     ~focal, ~sister,  ~P3,      ~type,
+  "BP1–BP2",       "BP1",  "TP1",    "BP2",    "BP–BP",
+  "BP1–BP3",       "BP1",  "TP1",    "BP3",    "BP–BP",
+  "BP2–BP3",       "BP2",  "TP2",    "BP3",    "BP–BP",
+  "BP1–BP_ANC",    "BP1",  "TP_OUT", "BP_ANC", "BP–other biphasic",
+  "BP2–BP_ANC",    "BP2",  "TP_OUT", "BP_ANC", "BP–other biphasic",
+  "BP3–BP_ANC",    "BP3",  "TP_OUT", "BP_ANC", "BP–other biphasic",
+  "TP1–BP_ANC",    "TP1",  "TP_OUT", "BP_ANC", "TP control",
+  "TP2–BP_ANC",    "TP2",  "TP_OUT", "BP_ANC", "TP control"
+)
+
+# Pick each hypothesis's trio from a Dsuite tree table and orient it so that + = focal–P3 sharing.
+orient_trios <- function(df) {
+  hyp_defs %>%
+    pmap_dfr(function(Hypothesis, focal, sister, P3, type) {
+      hit <- df[df$P3 == P3 & ((df$P1 == focal & df$P2 == sister) | (df$P1 == sister & df$P2 == focal)), ]
+      stopifnot(nrow(hit) == n_distinct(df$Peak))
+      hit %>% mutate(Hypothesis = Hypothesis, type = type, focal = focal, sister = sister,
+                     sign = ifelse(P2 == focal, 1, -1))
+    }) %>%
+    mutate(D_o = sign * D, Z_o = sign * Z, f4_o = sign * f4ratio,
+           SE = ifelse(Z != 0, abs(D / Z), NA_real_),
+           nSites = ABBA + BABA)
+}
+
+load_peaks <- function(dir) {
+  files <- list.files(dir, pattern = "^peak_[1-6]_tree\\.txt$", full.names = TRUE)
+  stopifnot(length(files) == 6)
+  map_dfr(files, ~ read_dsuite(.x, str_remove(basename(.x), "_tree\\.txt$")))
+}
+
+gw <- read_dsuite(file.path(intro_dir, "whole_genome_combined_tree.txt"), "genome") %>%
+  orient_trios() %>%
+  select(Hypothesis, D_gw = D_o, Z_gw = Z_o, f4_gw = f4_o, SE_gw = SE)
+
+summarise_peaks <- function(peaks_raw) {
+  peaks_raw %>%
+    orient_trios() %>%
+    left_join(gw, by = "Hypothesis") %>%
+    mutate(Z_diff = (D_o - D_gw) / SE,
+           q = p.adjust(p, method = "BH"),
+           # A peak signal needs q < 0.05, excess sharing with P3 and > 2 SE above genome-wide D (ESM Methods)
+           signal = q < 0.05 & D_o > 0 & Z_diff > 2,
+           Peak = factor(Peak, levels = paste0("peak_", 1:6), labels = paste("Peak", 1:6)),
+           Hypothesis = factor(Hypothesis, levels = hyp_defs$Hypothesis))
+}
+```
+
+## Extended peak windows
+
+```{r peaks}
+peaks_df <- summarise_peaks(load_peaks(peak_dir))
+
+peak_table <- peaks_df %>%
+  arrange(Hypothesis, Peak) %>%
+  transmute(Hypothesis, type, Peak, P1, P2, P3,
+            D = round(D_o, 3), Z = round(Z_o, 2), p = signif(p, 2), q = signif(q, 2),
+            f4_ratio = round(f4_o, 3), D_genome = round(D_gw, 3), Z_vs_genome = round(Z_diff, 2),
+            informative_sites = round(nSites), signal)
+write_tsv(peak_table, file.path(intro_dir, "peak_dtrios_summary.tsv"))
+write_csv(peak_table, file.path(intro_dir, "dsuite_six_hypotheses_by_peak.csv"))
+peak_table
+```
+
+```{r figS5, fig.width=6.7, fig.height=4.4}
+# Facet titles mark the two TP controls
+facet_lab <- function(h) ifelse(str_starts(h, "TP"), paste0(h, " (control)"), h)
+plot_df  <- peaks_df %>% mutate(facet = factor(facet_lab(as.character(Hypothesis)), levels = facet_lab(hyp_defs$Hypothesis)),
+                                peak_n = factor(str_remove(as.character(Peak), "Peak ")))
+gw_lines <- gw %>% mutate(facet = factor(facet_lab(Hypothesis), levels = facet_lab(hyp_defs$Hypothesis)))
+
+p <- ggplot(plot_df, aes(x = peak_n, y = D_o)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey70") +
+  geom_hline(data = gw_lines, aes(yintercept = D_gw), linetype = "dashed", linewidth = 0.5, colour = "grey30") +
+  geom_errorbar(aes(ymin = D_o - 1.96 * SE, ymax = D_o + 1.96 * SE), width = 0, linewidth = 0.6, colour = "grey25") +
+  geom_point(aes(shape = signal), size = 2, stroke = 0.7, fill = "white", colour = "black") +
+  scale_shape_manual(values = c(`FALSE` = 21, `TRUE` = 16),
+                     labels = c(`FALSE` = "not above genome-wide", `TRUE` = "q < 0.05 and > 2 SE above genome-wide"),
+                     name = NULL, drop = FALSE) +
+  facet_wrap(~ facet, nrow = 2) +
+  labs(x = "GWAS peak", y = "Patterson's D") +
+  theme_bw(base_size = 9) +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 8), legend.text = element_text(size = 8),
+        strip.background = element_blank(), strip.text = element_text(face = "bold", size = 8.5),
+        legend.position = "bottom", legend.margin = margin(0, 0, 0, 0))
+p
+ggsave(file.path(fig_dir, "FigS5_peak_D.pdf"), p, width = 6.7, height = 4.4)
+ggsave(file.path(fig_dir, "FigS5_peak_D.png"), p, width = 6.7, height = 4.4, dpi = 300)
+```

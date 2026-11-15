@@ -1,0 +1,755 @@
+---
+title: "Triage of recurrent wobble GWAS leads"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: kable
+---
+
+**Purpose.** Five SNPs recurred across earlier wobble-phenotype scans. Those scans used
+*nested* sample sets (the same BAM fish appear in nearly all of them), so recurrence is not
+replication. This report re-tests each lead in the 67 Bambomo (BAM) fish with two label sets
+(the manual call and the label-free P0 classifier) and against the two continuous P0 traits
+(`repro`, `|vP0|`). It also asks whether the signal rests on a handful of fish. APA fish are
+reported as context for every lead and are the primary test population for lead 5 (TP vs
+Wobble).
+
+**What this is not.** It is not a new GWAS and not an independent replication. The BAM (and APA)
+fish tested here were part of the discovery scans, so the manual-label p values below are
+re-tests on discovery data and are expected to be small. The informative comparisons are
+(i) whether the signal holds when the labels are replaced by the classifier's, which disagree
+with the manual calls for a minority of fish, and (ii) whether it tracks the continuous traits. The
+classifier labels largely agree with the manual ones, so (i) is a partial check, not an
+independent one. Fisher and Spearman tests do not model kinship (unlike GEMMA's LMM), so
+shared ancestry among a few fish can inflate them.
+
+**Verdict rules (fixed before looking at the results).**
+
+* Primary test = allelic Fisher exact (additive, like GEMMA's additive model); the 2x3
+  genotypic Fisher is reported alongside and does not assume Hardy-Weinberg proportions.
+* Bonferroni across the 5 leads (p x 5) is applied per test. A stricter all-tests correction
+  (5 leads x 6 tests = p x 30) is reported as a robustness flag only.
+* `survives clean labels`: classifier-label allelic test Bonferroni p < 0.05, same direction
+  as the manual-label effect.
+* `manual-label-only`: manual-label allelic Bonferroni p < 0.05, but the classifier-label
+  test does not reach Bonferroni p < 0.05 (or the effect changes direction).
+* `no support`: neither label set reaches Bonferroni p < 0.05.
+* Primary population: BAM (BP vs Wobble) for leads 1-4; APA (TP vs Wobble) for lead 5, with
+  BAM reported for it as well.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 4.2, dpi = 110)
+root <- rprojroot::find_root(rprojroot::has_file(".git") | rprojroot::is_git_root)
+knitr::opts_knit$set(root.dir = root)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(patchwork)
+  library(knitr)
+})
+
+vcf <- file.path(root, "output_data/07_Phasing",
+  "MIC4273_HAP2_NEWREF_MSU618_all_fish_all_sites.FILTERED_BIALLELIC_SNPS_ONLY.phased.renamed.vcf.gz")
+gff <- file.path(root, "input_data/00_Reference_Genome/paramormyrops_ncbi_0.4.renamed.sorted.gff")
+bam_tsv  <- file.path(root, "input_data/14_Wobble_Analysis/BAM_P0/BAM_P0.samples.tsv")
+p0_csv   <- file.path(root, "output_data/02_Phenotyping/p0_statistical_table.csv")
+meta_txt <- file.path(root, "input_data/01_Terra/data_model/fish_data_2023.txt")
+outdir   <- file.path(root, "output_data/14_Wobble_Analysis/RECURRENT_LEADS")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+bcftools <- Sys.which("bcftools")
+if (!nzchar(bcftools)) bcftools <- "/opt/homebrew/bin/bcftools"
+stopifnot(file.exists(vcf), file.exists(gff), file.exists(bam_tsv),
+          file.exists(p0_csv), file.exists(meta_txt))
+
+WIN     <- 250000   # LD window half-width (bp), primary
+WIN_EXT <- 1000000  # extended half-width, only to check whether a block runs past WIN
+EDGE    <- 25000    # block "at window edge" if an r2 >= R2_BLK SNP lies within this of the edge
+R2_BLK  <- 0.5      # r^2 threshold defining the block
+MAF_LD  <- 0.05     # within-population MAF filter for LD SNPs (the lead is always kept)
+N_LEADS <- 5        # Bonferroni divisor across leads
+N_TESTS <- 6        # tests per lead (manual/classifier x allelic/genotypic, 2 Spearman)
+
+pheno_colors <- c(TP = "#ed2224", Wobble = "#9b6dc5", BP = "#1ea8e0", Ambiguous = "grey60")
+fmt <- function(x) ifelse(is.na(x), "NA", trimws(formatC(x, format = "g", digits = 2)))
+```
+
+## Inputs and labels
+
+```{r labels}
+bam <- fread(bam_tsv) %>% as_tibble() %>%
+  transmute(PN, pop = "BAM", manual, stat_call, n_sweeps, repro, abs_vP0,
+            bin_manual = MANUAL_BIN, bin_cls = CLS_BIN, bin_strict = CLS_STRICT)
+stopifnot(nrow(bam) == 67)
+
+meta <- fread(meta_txt, sep = "\t") %>% as_tibble() %>%
+  transmute(PN = `entity:participant_id`, meta_pheno = Phenotype, meta_pop = POP)
+p0 <- fread(p0_csv) %>% as_tibble() %>%
+  transmute(PN = sample_name, p0_manual = manual_Phenotype, stat_call, n_sweeps,
+            repro, abs_vP0 = abs(vP0))
+
+# APA = POP == "APA" in the master metadata (APA_223 is POP == BAM and is in the BAM table)
+apa <- meta %>% filter(meta_pop == "APA") %>% left_join(p0, by = "PN") %>%
+  mutate(pop = "APA", manual = meta_pheno,
+         bin_manual = case_when(manual == "TP" ~ 0L, manual == "Wobble" ~ 1L),
+         # classifier: TP-call = 0; Wobble- or BP-call (P0 reduced or absent) = 1; Ambiguous = NA
+         bin_cls = case_when(stat_call == "TP" ~ 0L, stat_call %in% c("Wobble", "BP") ~ 1L),
+         # strict: manual and classifier agree (TP/TP = 0, Wobble/Wobble = 1)
+         bin_strict = case_when(manual == "TP" & stat_call == "TP" ~ 0L,
+                                manual == "Wobble" & stat_call == "Wobble" ~ 1L)) %>%
+  select(PN, pop, manual, stat_call, n_sweeps, repro, abs_vP0, bin_manual, bin_cls, bin_strict)
+stopifnot(all(apa$manual == p0$p0_manual[match(apa$PN, p0$PN)]))
+
+lab <- bind_rows(bam, apa)
+count(lab, pop, manual, stat_call) %>%
+  pivot_wider(names_from = stat_call, values_from = n, values_fill = 0)
+```
+
+* BAM: `bin_manual` = `MANUAL_BIN` (BP = 0, Wobble = 1, TP = NA), `bin_cls` = `CLS_BIN`
+  (classifier BP = 0, Wobble = 1; BAM_6494 anatomy-wobble = 1; Ambiguous and classifier-TP = NA),
+  `bin_strict` = `CLS_STRICT` (sensitivity only).
+* APA (no BP fish): `bin_manual` TP = 0 / Wobble = 1. `bin_cls` TP-call = 0 vs Wobble- or
+  BP-call = 1 (both mean P0 is reduced or absent; Ambiguous = NA). Four manual APA wobbles are
+  classifier TP-calls, which is what makes the APA classifier test informative.
+* Continuous traits: Spearman of ALT dosage vs `repro` and `|vP0|`. BAM excludes the manual
+  TP fish (BAM_6597); APA uses all fish (TP and Wobble span the trait range). Within-label
+  Spearman tests (inside one manual class) are reported as a label-independent check.
+
+## Leads
+
+```{r leads}
+leads <- tribble(
+  ~lead, ~chr,   ~pos,     ~contrast,      ~primary_pop, ~source_runs,
+  "L1", "chr9",  31189837, "BP vs Wobble", "BAM",
+    "APA_BEN_BAM_TP1_BP2_APAWOB2_BAMWOB1 (p 4.4e-9, dropped by af>0.15 filter); APA_BAM BP vs TP+wob LRT (9e-9); 2009-cohort BAM BP vs Wob LRT (run name); PLINK BAM_BP_VS_WOB (5.7e-7)",
+  "L2", "chr4",  19235832, "BP vs Wobble", "BAM",
+    "PKINGS_ALL_WOB_INCLUDED; APA_BAM_BEN_BP0_TPWOB1; APA_BAM_BEN_TPBP0_WOB1; APA_BEN_BAM_TP2_BP0_WOB1; conditional binary (3.4e-10)",
+  "L3", "chr13", 31603593, "BP vs Wobble", "BAM",
+    "APA_BAM_BEN_TPBP0_WOB1; BAM_ONLY_BP0_TPWOB1 (top, -log10p 6.02); APA_BAM LRT",
+  "L4", "chr3",  17486697, "BP vs Wobble", "BAM",
+    "ALL_PKINGS_BP0_WOBBLE1; conditional binary; BAM Welch t-test (7.2e-7)",
+  "L5", "chr7",  13388648, "TP vs Wobble", "APA",
+    "ALL_PKINGS_TP0_WOBBLE_1 (1.1e-10, af 0.10); APA_BEN_TP0_WOB1"
+)
+snps <- tribble(
+  ~lead, ~chr,   ~pos,     ~role,
+  "L1", "chr9",  31189837, "primary",
+  "L2", "chr4",  19235832, "primary",
+  "L2", "chr4",  19235840, "secondary",
+  "L3", "chr13", 31603593, "primary",
+  "L3", "chr13", 31616325, "secondary",
+  "L4", "chr3",  17486697, "primary",
+  "L4", "chr3",  17486351, "secondary",
+  "L5", "chr7",  13388648, "primary"
+)
+kable(leads %>% select(-source_runs))
+```
+
+## Genotype extraction and gene annotation
+
+Sites monomorphic in the 97 BAM + APA fish are dropped at extraction. Whether each lead
+position exists is checked against the full 305-sample VCF; if it were absent, the nearest SNP
+within 1 kb would be used.
+
+```{r extract}
+extract_window <- function(chr, from, to, samples) {
+  base <- sprintf("%s view -s %s -r %s:%d-%d %s 2>/dev/null | %s view -c 1:minor 2>/dev/null",
+                  bcftools, paste(samples, collapse = ","), chr, max(1, from), to,
+                  shQuote(vcf), bcftools)
+  ids <- system(sprintf("%s | %s query -l", base, bcftools), intern = TRUE)
+  dt <- fread(cmd = sprintf("%s | %s query -f '%%CHROM\\t%%POS\\t%%REF\\t%%ALT[\\t%%GT]\\n'",
+                            base, bcftools),
+              header = FALSE, sep = "\t", colClasses = "character")
+  setnames(dt, c("CHROM", "POS", "REF", "ALT", ids))
+  dt <- dt[!duplicated(dt$POS)]
+  gt <- as.matrix(dt[, ..ids])
+  dos <- (substr(gt, 1, 1) == "1") + (substr(gt, 3, 3) == "1")
+  dos[!grepl("^[01][|/][01]$", gt)] <- NA
+  rownames(gt) <- rownames(dos) <- dt$POS
+  list(info = tibble(CHROM = dt$CHROM, POS = as.integer(dt$POS), REF = dt$REF, ALT = dt$ALT),
+       gt = gt, dos = dos)
+}
+
+samples <- lab$PN
+geno <- setNames(lapply(seq_len(nrow(leads)), function(i)
+  extract_window(leads$chr[i], leads$pos[i] - WIN_EXT, leads$pos[i] + WIN_EXT, samples)),
+  leads$lead)
+stopifnot(all(sapply(geno, function(g) setequal(colnames(g$dos), samples))))
+sapply(geno, function(g) c(n_polymorphic_snps_2Mb = nrow(g$dos), n_missing_gt = sum(is.na(g$dos))))
+
+in_full_vcf <- function(chr, pos) {
+  length(system(sprintf("%s query -r %s:%d-%d -f '%%POS\\n' %s 2>/dev/null",
+                        bcftools, chr, pos, pos, shQuote(vcf)), intern = TRUE)) > 0
+}
+snps <- snps %>% rowwise() %>% mutate(
+  exact_in_vcf = in_full_vcf(chr, pos),
+  pos_used = { p <- geno[[lead]]$info$POS; d <- abs(p - pos)
+               if (exact_in_vcf && pos %in% p) pos else if (min(d) <= 1000) p[which.min(d)] else NA_integer_ },
+  snp_note = case_when(is.na(pos_used) ~ "no SNP within 1 kb",
+                       pos_used == pos ~ "exact position present",
+                       TRUE ~ paste0("exact position absent; nearest SNP ", pos_used - pos, " bp away")),
+  snp = paste0(chr, ":", pos_used)) %>% ungroup()
+kable(snps %>% select(lead, snp, role, exact_in_vcf, snp_note))
+
+genes <- fread(cmd = sprintf("awk -F'\\t' '$3==\"gene\"||$3==\"pseudogene\"' %s", shQuote(gff)),
+               header = FALSE, sep = "\t", quote = "") %>% as_tibble() %>%
+  transmute(chr = V1, start = V4, end = V5, strand = V7,
+            name = str_match(V9, "Name=([^;]+)")[, 2],
+            biotype = str_match(V9, "gene_biotype=([^;]+)")[, 2],
+            description = vapply(coalesce(str_match(V9, "description=([^;]+)")[, 2], ""),
+                                 URLdecode, character(1))) %>%
+  filter(chr %in% leads$chr)
+```
+
+## Statistics
+
+```{r stats-functions}
+# Exact SNP-HWE test (Wigginton, Cutler & Abecasis 2005)
+hwe_exact <- function(n_hom1, n_het, n_hom2) {
+  homr <- min(n_hom1, n_hom2); homc <- max(n_hom1, n_hom2)
+  rare <- 2 * homr + n_het; N <- n_het + homr + homc
+  if (N == 0 || rare == 0) return(NA_real_)
+  probs <- numeric(rare + 1)
+  mid <- floor(rare * (2 * N - rare) / (2 * N))
+  if ((mid %% 2) != (rare %% 2)) mid <- mid + 1
+  probs[mid + 1] <- 1
+  h <- mid; cr <- (rare - mid) / 2; cc <- N - mid - cr
+  while (h >= 2) {
+    probs[h - 1] <- probs[h + 1] * h * (h - 1) / (4 * (cr + 1) * (cc + 1))
+    h <- h - 2; cr <- cr + 1; cc <- cc + 1
+  }
+  h <- mid; cr <- (rare - mid) / 2; cc <- N - mid - cr
+  while (h <= rare - 2) {
+    probs[h + 3] <- probs[h + 1] * 4 * cr * cc / ((h + 2) * (h + 1))
+    h <- h + 2; cr <- cr - 1; cc <- cc - 1
+  }
+  probs <- probs / sum(probs)
+  min(1, sum(probs[probs <= probs[n_het + 1] * (1 + 1e-7)]))
+}
+stopifnot(hwe_exact(25, 50, 25) > 0.99, hwe_exact(10, 0, 10) < 1e-4)
+
+fisher_geno <- function(d, grp) {
+  ok <- !is.na(d) & !is.na(grp)
+  tb <- table(factor(grp[ok], levels = 0:1), factor(d[ok], levels = 0:2))
+  tb <- tb[rowSums(tb) > 0, colSums(tb) > 0, drop = FALSE]
+  if (nrow(tb) < 2 || ncol(tb) < 2) return(NA_real_)
+  fisher.test(tb)$p.value
+}
+# allelic test; OR = odds of the ALT allele in group 1 (Wobble) vs group 0 (BP or TP)
+fisher_allelic <- function(d, grp) {
+  ok <- !is.na(d) & !is.na(grp)
+  a1 <- sum(d[ok & grp == 1]); n1 <- 2 * sum(ok & grp == 1)
+  a0 <- sum(d[ok & grp == 0]); n0 <- 2 * sum(ok & grp == 0)
+  tb <- matrix(c(a1, n1 - a1, a0, n0 - a0), 2, byrow = TRUE)
+  if (any(rowSums(tb) == 0) || any(colSums(tb) == 0)) return(c(p = NA, or = NA))
+  ft <- fisher.test(tb)
+  c(p = ft$p.value, or = unname(ft$estimate))
+}
+spear <- function(d, y) {
+  ok <- !is.na(d) & !is.na(y)
+  if (sum(ok) < 5 || var(d[ok]) == 0) return(c(rho = NA, p = NA, n = sum(ok)))
+  ct <- suppressWarnings(cor.test(d[ok], y[ok], method = "spearman", exact = FALSE))
+  c(rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+}
+cnt <- function(d) paste(table(factor(d, levels = 0:2)), collapse = "/")  # homREF/het/homALT
+cnt_by <- function(d, g, lv) paste(sapply(lv, function(l) paste(l, cnt(d[g %in% l]))), collapse = " | ")
+```
+
+```{r run-tests}
+per_snp <- list(); per_fish <- list(); hwe_rows <- list(); within_rows <- list()
+for (i in seq_len(nrow(snps))) {
+  s <- snps[i, ]; g <- geno[[s$lead]]; key <- as.character(s$pos_used)
+  inf <- g$info %>% filter(POS == s$pos_used)
+  pf <- lab %>% mutate(lead = s$lead, snp = s$snp, role = s$role, REF = inf$REF, ALT = inf$ALT,
+                       GT = g$gt[key, PN], dosage = g$dos[key, PN])
+  per_fish[[i]] <- pf
+  res <- list(lead = s$lead, role = s$role, snp = s$snp, snp_note = s$snp_note,
+              REF = inf$REF, ALT = inf$ALT)
+  for (P in c("BAM", "APA")) {
+    x <- pf %>% filter(pop == P)
+    af <- mean(x$dosage) / 2
+    res[[paste0("af_", P)]] <- af
+    res[[paste0("minor_", P)]] <- if (af <= 0.5) inf$ALT else inf$REF
+    lv_m <- if (P == "BAM") c("BP", "Wobble", "TP") else c("TP", "Wobble")
+    lv_c <- if (P == "BAM") c("BP", "Wobble", "Ambiguous", "TP") else c("TP", "Wobble", "BP", "Ambiguous")
+    res[[paste0("geno_manual_", P)]] <- cnt_by(x$dosage, x$manual, lv_m)
+    res[[paste0("geno_cls_", P)]]    <- cnt_by(x$dosage, x$stat_call, lv_c)
+    for (L in c("manual", "cls", "strict")) {
+      gg <- x[[paste0("bin_", L)]]
+      fa <- fisher_allelic(x$dosage, gg)
+      if (L != "strict") res[[paste0("fisher_geno_", L, "_", P)]] <- fisher_geno(x$dosage, gg)
+      res[[paste0("fisher_allelic_", L, "_", P)]] <- fa[["p"]]
+      res[[paste0("OR_alt_", L, "_", P)]]         <- fa[["or"]]
+      res[[paste0("af_g0_", L, "_", P)]] <- mean(x$dosage[gg %in% 0]) / 2
+      res[[paste0("af_g1_", L, "_", P)]] <- mean(x$dosage[gg %in% 1]) / 2
+    }
+    xs <- if (P == "BAM") x %>% filter(manual != "TP") else x
+    for (tr in c("repro", "abs_vP0")) {
+      sp <- spear(xs$dosage, xs[[tr]])
+      res[[paste0("rho_", tr, "_", P)]] <- sp[["rho"]]
+      res[[paste0("p_", tr, "_", P)]]   <- sp[["p"]]
+      res[[paste0("n_", tr, "_", P)]]   <- sp[["n"]]
+      for (l in if (P == "BAM") c("BP", "Wobble") else c("TP", "Wobble")) {
+        sw <- spear(x$dosage[x$manual == l], x[[tr]][x$manual == l])
+        within_rows[[length(within_rows) + 1]] <- tibble(lead = s$lead, role = s$role, snp = s$snp,
+          pop = P, within = l, trait = tr, rho = sw[["rho"]], p = sw[["p"]], n = sw[["n"]],
+          n_minor_carriers = sum(if (af <= 0.5) x$dosage[x$manual == l] > 0 else x$dosage[x$manual == l] < 2))
+      }
+    }
+    grp_list <- list(all = rep(TRUE, nrow(x)))
+    for (l in lv_m) grp_list[[paste0("manual_", l)]] <- x$manual == l
+    if (P == "BAM") for (l in c("BP", "Wobble")) grp_list[[paste0("cls_", l)]] <- x$bin_cls %in% as.integer(l == "Wobble")
+    for (gn in names(grp_list)) {
+      dd <- x$dosage[grp_list[[gn]]]
+      if (length(dd) < 5) next
+      n0 <- sum(dd == 0); n1 <- sum(dd == 1); n2 <- sum(dd == 2); n <- length(dd)
+      q <- (n1 + 2 * n2) / (2 * n)
+      hwe_rows[[length(hwe_rows) + 1]] <- tibble(
+        lead = s$lead, snp = s$snp, pop = P, group = gn, n = n,
+        counts = paste(n0, n1, n2, sep = "/"), het_obs = n1 / n, het_exp = 2 * q * (1 - q),
+        hwe_p = hwe_exact(n0, n1, n2))
+    }
+  }
+  # BAM fish whose manual and classifier labels disagree in the BP/Wobble direction
+  xb <- pf %>% filter(pop == "BAM")
+  re <- xb %>% filter(manual == "Wobble", stat_call == "BP")
+  res$reassigned_WobToBP <- paste0(paste(re$PN, re$dosage, sep = "=", collapse = ","),
+                                  sprintf(" (ALT freq %.2f)", mean(re$dosage) / 2))
+  res$af_reassigned_WobToBP <- mean(re$dosage) / 2
+  res$dosage_BAM_6494 <- xb$dosage[xb$PN == "BAM_6494"]
+  # sensitivity (BAM, manual allelic): drop minor homozygotes; worst leave-one-out
+  minor_dos <- if (res$af_BAM <= 0.5) 2 else 0
+  mh <- xb %>% filter(dosage == minor_dos)
+  res$n_minor_hom_BAM <- nrow(mh)
+  res$minor_hom_BAM <- if (nrow(mh)) paste(sprintf("%s(%s/%s; repro %s; |vP0| %s)", mh$PN, mh$manual,
+      mh$stat_call, ifelse(is.na(mh$repro), "NA", sprintf("%.2f", mh$repro)),
+      sprintf("%.1e", mh$abs_vP0)), collapse = "; ") else ""
+  keep <- xb$dosage != minor_dos
+  res$p_allelic_manual_BAM_drop_minor_hom <- fisher_allelic(xb$dosage[keep], xb$bin_manual[keep])[["p"]]
+  res$p_allelic_cls_BAM_drop_minor_hom    <- fisher_allelic(xb$dosage[keep], xb$bin_cls[keep])[["p"]]
+  idx <- which(!is.na(xb$bin_manual))
+  res$p_allelic_manual_BAM_worst_LOO <- max(sapply(idx, function(j)
+    fisher_allelic(xb$dosage[-j], xb$bin_manual[-j])[["p"]]))
+  xa <- pf %>% filter(pop == "APA")
+  minor_a <- if (res$af_APA <= 0.5) 2 else 0
+  mha <- xa %>% filter(dosage == minor_a)
+  res$n_minor_hom_APA <- nrow(mha)
+  res$minor_hom_APA <- if (nrow(mha)) paste(sprintf("%s(%s/%s; |vP0| %s)", mha$PN, mha$manual,
+      mha$stat_call, sprintf("%.1e", mha$abs_vP0)), collapse = "; ") else ""
+  keepa <- xa$dosage != minor_a
+  res$p_allelic_manual_APA_drop_minor_hom <- fisher_allelic(xa$dosage[keepa], xa$bin_manual[keepa])[["p"]]
+  res$p_allelic_cls_APA_drop_minor_hom    <- fisher_allelic(xa$dosage[keepa], xa$bin_cls[keepa])[["p"]]
+  idxa <- which(!is.na(xa$bin_manual))
+  res$p_allelic_manual_APA_worst_LOO <- suppressWarnings(max(sapply(idxa, function(j)
+    fisher_allelic(xa$dosage[-j], xa$bin_manual[-j])[["p"]]), na.rm = TRUE))
+  per_snp[[i]] <- as_tibble(res)
+}
+per_snp  <- bind_rows(per_snp)
+per_fish <- bind_rows(per_fish)
+hwe_tab  <- bind_rows(hwe_rows)
+within_tab <- bind_rows(within_rows)
+
+pcols <- grep("^(fisher_(allelic|geno)_(manual|cls)_|p_repro_|p_abs_vP0_)", names(per_snp), value = TRUE)
+per_snp <- per_snp %>%
+  mutate(across(all_of(pcols), ~ pmin(1, .x * N_LEADS), .names = "{.col}_bonf"),
+         across(all_of(pcols), ~ pmin(1, .x * N_LEADS * N_TESTS), .names = "{.col}_bonf30"))
+```
+
+## Results per SNP
+
+ALT-allele dosage throughout. Counts are `homREF/het/homALT`. OR = odds of ALT in group 1
+(Wobble) vs group 0 (BAM: BP; APA: TP). "Bonf" = x5 leads.
+
+```{r show-per-snp}
+per_snp %>% transmute(lead, role, snp, `REF>ALT` = paste0(REF, ">", ALT),
+  af_BAM = round(af_BAM, 3), geno_manual_BAM, geno_cls_BAM,
+  `allelic p manual (Bonf)` = paste0(fmt(fisher_allelic_manual_BAM), " (", fmt(fisher_allelic_manual_BAM_bonf), ")"),
+  `geno p manual` = fmt(fisher_geno_manual_BAM),
+  `OR manual` = round(OR_alt_manual_BAM, 2),
+  `allelic p cls (Bonf)` = paste0(fmt(fisher_allelic_cls_BAM), " (", fmt(fisher_allelic_cls_BAM_bonf), ")"),
+  `geno p cls` = fmt(fisher_geno_cls_BAM),
+  `OR cls` = round(OR_alt_cls_BAM, 2),
+  `allelic p strict` = fmt(fisher_allelic_strict_BAM)) %>% kable()
+```
+
+**Continuous traits (BAM, manual TP excluded):**
+
+```{r show-cont}
+per_snp %>% transmute(lead, role, snp,
+  `rho repro` = round(rho_repro_BAM, 2), `p repro (Bonf)` = paste0(fmt(p_repro_BAM), " (", fmt(p_repro_BAM_bonf), ")"),
+  n_repro = n_repro_BAM,
+  `rho |vP0|` = round(rho_abs_vP0_BAM, 2), `p |vP0| (Bonf)` = paste0(fmt(p_abs_vP0_BAM), " (", fmt(p_abs_vP0_BAM_bonf), ")"),
+  n_vP0 = n_abs_vP0_BAM) %>% kable()
+```
+
+**APA (context; primary for L5).** Manual TP vs Wobble; classifier TP-call vs Wobble/BP-call.
+
+```{r show-apa}
+per_snp %>% transmute(lead, role, snp, af_APA = round(af_APA, 3),
+  geno_manual_APA, geno_cls_APA,
+  `allelic p manual (Bonf)` = paste0(fmt(fisher_allelic_manual_APA), " (", fmt(fisher_allelic_manual_APA_bonf), ")"),
+  `geno p manual` = fmt(fisher_geno_manual_APA), `OR manual` = round(OR_alt_manual_APA, 2),
+  `allelic p cls (Bonf)` = paste0(fmt(fisher_allelic_cls_APA), " (", fmt(fisher_allelic_cls_APA_bonf), ")"),
+  `geno p cls` = fmt(fisher_geno_cls_APA), `OR cls` = round(OR_alt_cls_APA, 2),
+  `allelic p strict` = fmt(fisher_allelic_strict_APA),
+  `rho |vP0|` = round(rho_abs_vP0_APA, 2), `p |vP0|` = fmt(p_abs_vP0_APA),
+  `rho repro` = round(rho_repro_APA, 2), `p repro` = fmt(p_repro_APA)) %>% kable()
+```
+
+**Within one manual class** (Spearman of dosage vs trait inside a single label; this does
+not depend on where the BP/Wobble or TP/Wobble line is drawn). Primary SNPs, nominal p.
+
+```{r show-within}
+within_tab %>% filter(role == "primary", !is.na(rho)) %>%
+  mutate(rho = round(rho, 2), p = fmt(p)) %>%
+  select(lead, snp, pop, within, trait, n, n_minor_carriers, rho, p) %>% kable()
+```
+
+**Hardy-Weinberg within groups** (exact test; groups with n >= 5; full table in
+`hwe_by_group.tsv`). Rows with p < 0.05:
+
+```{r show-hwe}
+hw <- hwe_tab %>% filter(hwe_p < 0.05)
+if (nrow(hw)) hw %>% mutate(across(c(het_obs, het_exp), ~ round(.x, 2)), hwe_p = fmt(hwe_p)) %>% kable() else
+  cat("None: no group deviates from HWE at p < 0.05 at any tested SNP (min p =",
+      fmt(min(hwe_tab$hwe_p, na.rm = TRUE)), "). Genotypes are phased (SHAPEIT4) calls.\n")
+```
+
+**Is the signal carried by a few fish?** BAM minor-allele homozygotes, the BAM allelic p after
+dropping them, and the worst single-fish leave-one-out p (manual labels).
+
+```{r show-sens}
+per_snp %>% transmute(lead, role, snp, n_minor_hom_BAM,
+  `p manual, drop minor hom` = fmt(p_allelic_manual_BAM_drop_minor_hom),
+  `p cls, drop minor hom` = fmt(p_allelic_cls_BAM_drop_minor_hom),
+  `p manual, worst LOO` = fmt(p_allelic_manual_BAM_worst_LOO),
+  minor_hom_BAM) %>% kable()
+per_snp %>% filter(n_minor_hom_APA > 0) %>% transmute(lead, role, snp, n_minor_hom_APA,
+  `APA p manual, drop minor hom` = fmt(p_allelic_manual_APA_drop_minor_hom),
+  `APA p cls, drop minor hom` = fmt(p_allelic_cls_APA_drop_minor_hom),
+  `APA p manual, worst LOO` = fmt(p_allelic_manual_APA_worst_LOO), minor_hom_APA) %>% kable()
+```
+
+**Fish where manual and classifier labels disagree** (BAM; ALT dosage at each primary SNP).
+The four manual-Wobble / classifier-BP fish (APA_223, BAM_175, BAM_6499, BAM_6834) and
+BAM_6494 (manual BP, classifier-wobble by anatomy) are the fish that move between groups when
+labels change. If they carry the genotype of their *manual* group, the classifier test loses
+power for that lead. That pattern does not by itself say which label is right. Descriptive only (n = 5).
+
+```{r show-discordant}
+disc <- lab %>% filter(pop == "BAM",
+  (manual == "Wobble" & stat_call != "Wobble") | (manual == "BP" & stat_call != "BP")) %>% pull(PN)
+per_fish %>% filter(role == "primary", PN %in% disc) %>%
+  select(PN, manual, stat_call, bin_cls, repro, abs_vP0, lead, dosage) %>%
+  mutate(repro = round(repro, 2), abs_vP0 = signif(abs_vP0, 2)) %>%
+  pivot_wider(names_from = lead, values_from = dosage) %>% arrange(manual, stat_call) %>% kable()
+per_snp %>% filter(role == "primary") %>% transmute(lead, snp,
+  `ALT freq manual BP` = round(af_g0_manual_BAM, 2), `ALT freq manual Wobble` = round(af_g1_manual_BAM, 2),
+  `ALT freq 4 Wob->clsBP fish` = round(af_reassigned_WobToBP, 2),
+  `resemble` = ifelse(abs(af_reassigned_WobToBP - af_g1_manual_BAM) < abs(af_reassigned_WobToBP - af_g0_manual_BAM),
+                      "manual Wobble", "BP"),
+  `BAM_6494 dosage` = dosage_BAM_6494) %>% kable()
+```
+
+## Local LD blocks and genes
+
+r^2 is the squared Pearson correlation of ALT dosages between the lead and every SNP within
++/-250 kb with within-population MAF >= `r MAF_LD` (the lead is always kept). The block is the
+span from the leftmost to the rightmost SNP with r^2 >= `r R2_BLK`; it can include gaps. LD is
+computed in BAM for all leads (as specified) and also in APA for L5, whose lead is rare in BAM.
+The block used for genes is the one from the lead's primary population. A +/-1 Mb extent is
+reported only to show whether a block runs past the +/-250 kb window.
+
+```{r ld}
+ld_one <- function(L, P, half) {
+  g <- geno[[L$lead]]; ids <- lab$PN[lab$pop == P]
+  D <- g$dos[, ids, drop = FALSE]
+  inwin <- abs(g$info$POS - L$pos) <= half
+  af <- rowMeans(D) / 2; maf <- pmin(af, 1 - af)
+  is_lead <- g$info$POS == L$pos
+  keep <- inwin & (maf >= MAF_LD | is_lead)
+  lead_d <- D[as.character(L$pos), ]
+  if (var(lead_d) == 0) return(NULL)
+  r2 <- suppressWarnings(as.vector(cor(t(D[keep, , drop = FALSE]), lead_d)^2))
+  g$info[keep, ] %>% mutate(lead = L$lead, ld_pop = P, maf = maf[keep], r2 = r2, dist = POS - L$pos)
+}
+block_of <- function(ld, L, half) {
+  blk <- ld %>% filter(r2 >= R2_BLK)
+  tibble(block_start = min(blk$POS), block_end = max(blk$POS),
+         block_span_kb = round((max(blk$POS) - min(blk$POS)) / 1000, 1), n_block_snps = nrow(blk),
+         block_at_window_edge = any(abs(blk$dist) >= half - EDGE),
+         max_r2_other = max(ld$r2[ld$POS != L$pos], na.rm = TRUE))
+}
+ld_rows <- list(); blocks <- list()
+for (i in seq_len(nrow(leads))) {
+  L <- leads[i, ]
+  for (P in unique(c("BAM", L$primary_pop))) {
+    ld  <- ld_one(L, P, WIN)
+    ldx <- ld_one(L, P, WIN_EXT)
+    if (is.null(ld)) next
+    ld_rows[[length(ld_rows) + 1]] <- ld
+    b  <- block_of(ld, L, WIN)
+    bx <- block_of(ldx, L, WIN_EXT)
+    blocks[[length(blocks) + 1]] <- bind_cols(tibble(lead = L$lead, ld_pop = P,
+      lead_maf = round(ld$maf[ld$POS == L$pos], 3), n_window_snps = nrow(ld)), b,
+      ext_1Mb_start = bx$block_start, ext_1Mb_end = bx$block_end,
+      ext_1Mb_span_kb = bx$block_span_kb, ext_1Mb_n = bx$n_block_snps)
+  }
+}
+ld_all <- bind_rows(ld_rows); blocks <- bind_rows(blocks)
+blocks %>% mutate(max_r2_other = round(max_r2_other, 2)) %>% kable()
+
+# genes: from the primary-population block
+gene_rows <- list(); block_genes <- list()
+for (i in seq_len(nrow(leads))) {
+  L <- leads[i, ]; b <- blocks %>% filter(lead == L$lead, ld_pop == L$primary_pop)
+  gi <- genes %>% filter(chr == L$chr, end >= b$block_start, start <= b$block_end)
+  gc <- genes %>% filter(chr == L$chr) %>%
+    mutate(dist_to_lead = pmax(0, start - L$pos, L$pos - end)) %>% arrange(dist_to_lead)
+  near <- gc %>% slice(1); near_pc <- gc %>% filter(biotype == "protein_coding") %>% slice(1)
+  gene_rows[[i]] <- tibble(lead = L$lead,
+    genes = if (nrow(gi)) paste(gi$name, collapse = ";") else "none",
+    lead_in_gene = if (near$dist_to_lead == 0) near$name else "intergenic",
+    nearest_gene = sprintf("%s (%s, %s bp)", near$name, near$biotype, near$dist_to_lead),
+    nearest_protein_coding = sprintf("%s (%s bp; %s)", near_pc$name, near_pc$dist_to_lead, near_pc$description))
+  block_genes[[i]] <- gi %>% mutate(lead = L$lead, ld_pop = L$primary_pop, .before = 1)
+}
+gene_tab <- bind_rows(gene_rows); block_genes <- bind_rows(block_genes)
+kable(gene_tab)
+kable(block_genes %>% select(lead, name, start, end, biotype, description))
+```
+
+Pairwise r^2 (BAM) between the recurrent positions within a lead:
+
+```{r pair-r2}
+bam_ids <- lab$PN[lab$pop == "BAM"]
+snps %>% filter(role == "secondary") %>% rowwise() %>% mutate(
+  r2_with_primary_BAM = round(cor(geno[[lead]]$dos[as.character(pos_used), bam_ids],
+    geno[[lead]]$dos[as.character(leads$pos[leads$lead == lead]), bam_ids])^2, 3)) %>%
+  ungroup() %>% select(lead, snp, r2_with_primary_BAM) %>% kable()
+```
+
+## Figures
+
+Left: ALT dosage at the primary SNP against |vP0| (log scale), BAM and APA; colour = manual
+label, shape = classifier call. Right: r^2 with the lead across +/-250 kb in the lead's
+primary population, genes as grey bars, dashed line at r^2 = 0.5.
+
+```{r figs, fig.height = 4.2, results = "asis"}
+for (i in seq_len(nrow(leads))) {
+  L <- leads[i, ]
+  pf <- per_fish %>% filter(lead == L$lead, role == "primary")
+  p1 <- ggplot(pf, aes(x = factor(dosage, levels = 0:2), y = abs_vP0)) +
+    geom_jitter(aes(colour = manual, shape = stat_call), width = 0.2, height = 0, size = 2.2, alpha = 0.85) +
+    scale_y_log10() + facet_wrap(~ pop) +
+    scale_colour_manual(values = pheno_colors) +
+    scale_shape_manual(values = c(BP = 16, Wobble = 17, Ambiguous = 4, TP = 15)) +
+    labs(x = paste0("ALT dosage at ", L$chr, ":", L$pos), y = "|vP0|",
+         colour = "manual", shape = "classifier") + theme_bw(10)
+  ld <- ld_all %>% filter(lead == L$lead, ld_pop == L$primary_pop)
+  gg <- genes %>% filter(chr == L$chr, end >= L$pos - WIN, start <= L$pos + WIN) %>%
+    mutate(start = pmax(start, L$pos - WIN), end = pmin(end, L$pos + WIN),
+           y = -0.06 - 0.05 * (row_number() %% 3))
+  p2 <- ggplot(ld, aes(POS / 1e6, r2)) + geom_point(size = 0.5, alpha = 0.4, colour = "grey30") +
+    geom_hline(yintercept = R2_BLK, linetype = 2, colour = "firebrick") +
+    geom_vline(xintercept = L$pos / 1e6, colour = "firebrick", alpha = 0.5) +
+    geom_segment(data = gg, aes(x = start / 1e6, xend = end / 1e6, y = y, yend = y),
+                 inherit.aes = FALSE, linewidth = 2, colour = "grey55") +
+    labs(x = paste0(L$chr, " (Mb)"), y = bquote(r^2 ~ "with lead (" * .(L$primary_pop) * ")")) +
+    theme_bw(10)
+  cat("\n\n### ", L$lead, " ", L$chr, ":", L$pos, "\n\n", sep = "")
+  print(p1 + p2 + plot_layout(widths = c(1.1, 1)))
+}
+```
+
+## Verdicts
+
+```{r verdict}
+prim <- per_snp %>% filter(role == "primary") %>%
+  left_join(leads %>% select(lead, primary_pop), by = "lead")
+getp <- function(r, stem, P, suffix = "") r[[paste0(stem, "_", P, suffix)]]
+verdict_one <- function(r, P) {
+  pm <- getp(r, "fisher_allelic_manual", P, "_bonf"); pc <- getp(r, "fisher_allelic_cls", P, "_bonf")
+  om <- getp(r, "OR_alt_manual", P); oc <- getp(r, "OR_alt_cls", P)
+  same_dir <- !is.na(om) && !is.na(oc) && sign(log(om)) == sign(log(oc))
+  if (!is.na(pc) && pc < 0.05 && same_dir) "survives clean labels"
+  else if (!is.na(pm) && pm < 0.05) "manual-label-only"
+  else "no support"
+}
+prim$verdict <- vapply(seq_len(nrow(prim)), function(k) verdict_one(prim[k, ], prim$primary_pop[k]), character(1))
+prim$verdict_BAM <- vapply(seq_len(nrow(prim)), function(k) verdict_one(prim[k, ], "BAM"), character(1))
+prim$robust_all_tests <- vapply(seq_len(nrow(prim)), function(k) {
+  r <- prim[k, ]; P <- r$primary_pop
+  isTRUE(getp(r, "fisher_allelic_cls", P, "_bonf30") < 0.05)
+}, logical(1))
+
+prim <- prim %>% left_join(blocks %>% filter(ld_pop == "BAM") %>%
+                             select(lead, n_block_snps_BAM = n_block_snps, max_r2_other_BAM = max_r2_other), by = "lead")
+prim$reasoning <- vapply(seq_len(nrow(prim)), function(k) {
+  r <- prim[k, ]; P <- r$primary_pop
+  base <- sprintf("%s manual p=%s -> classifier p=%s (Bonf x5 %s, x30 %s); repro rho=%.2f p=%s, |vP0| rho=%.2f p=%s",
+    P, fmt(getp(r, "fisher_allelic_manual", P)), fmt(getp(r, "fisher_allelic_cls", P)),
+    fmt(getp(r, "fisher_allelic_cls", P, "_bonf")), fmt(getp(r, "fisher_allelic_cls", P, "_bonf30")),
+    getp(r, "rho_repro", P), fmt(getp(r, "p_repro", P)),
+    getp(r, "rho_abs_vP0", P), fmt(getp(r, "p_abs_vP0", P)))
+  extra <- c()
+  if (P == "BAM") {
+    extra <- c(extra, sprintf("4 manual-Wob/cls-BP fish ALT freq %.2f (BP %.2f, Wob %.2f)",
+                              r$af_reassigned_WobToBP, r$af_g0_manual_BAM, r$af_g1_manual_BAM))
+    if (r$n_minor_hom_BAM > 0) extra <- c(extra, sprintf("%d BAM minor homs; cls p without them %s",
+                              r$n_minor_hom_BAM, fmt(r$p_allelic_cls_BAM_drop_minor_hom)))
+    if (r$af_APA == 0 || r$af_APA == 1) extra <- c(extra, "monomorphic in APA")
+    if (r$n_block_snps_BAM == 1) extra <- c(extra, sprintf("no LD partner r2>=0.5 within 250 kb (max %.2f)", r$max_r2_other_BAM))
+  } else {
+    pa <- per_fish %>% filter(lead == r$lead, role == "primary", pop == P)
+    mw_tp <- pa %>% filter(manual == "Wobble", stat_call == "TP")
+    wt <- within_tab %>% filter(lead == r$lead, role == "primary", pop == P, within == "TP", trait == "abs_vP0")
+    extra <- c(extra,
+      sprintf("%d manual-Wob/cls-TP fish dosages %s, |vP0| max %.1e vs manual-TP min %.1e",
+              nrow(mw_tp), paste(mw_tp$dosage, collapse = ","), max(mw_tp$abs_vP0, na.rm = TRUE),
+              min(pa$abs_vP0[pa$manual == "TP"], na.rm = TRUE)),
+      sprintf("within manual TP |vP0| rho=%.2f p=%s (%d minor carriers)", wt$rho, fmt(wt$p), wt$n_minor_carriers),
+      sprintf("BAM: ALT freq %.3f, manual p=%s, cls p=%s (%s)", r$af_BAM,
+              fmt(r$fisher_allelic_manual_BAM), fmt(r$fisher_allelic_cls_BAM), r$verdict_BAM))
+  }
+  paste(c(base, extra), collapse = "; ")
+}, character(1))
+prim %>% select(lead, snp, verdict, robust_all_tests, reasoning) %>% kable()
+```
+
+## Reading the results
+
+```{r helpers, include = FALSE}
+v  <- function(l, col) prim[[col]][prim$lead == l]
+bk <- function(l, col, P = NULL) { P <- P %||% leads$primary_pop[leads$lead == l]
+  blocks[[col]][blocks$lead == l & blocks$ld_pop == P] }
+wi <- function(l, P, w, tr) within_tab %>% filter(lead == l, role == "primary", pop == P, within == w, trait == tr)
+```
+
+These notes are modest by design: n is small, every fish here was in the discovery scans,
+and the tests ignore kinship.
+
+* **L3 (chr13:31603593) is the strongest BAM lead.** Its classifier-label test
+  (p = `r fmt(v("L3","fisher_allelic_cls_BAM"))`) and its `repro` association
+  (rho = `r round(v("L3","rho_repro_BAM"),2)`, p = `r fmt(v("L3","p_repro_BAM"))`) both pass even
+  the x30 correction. Every carrier is heterozygous (`r v("L3","geno_manual_BAM")`), so no
+  small set of homozygotes drives it. The allele is also present in APA
+  (freq `r round(v("L3","af_APA"),2)`) with no TP/Wobble association there. Its BAM block spans
+  `r bk("L3","block_span_kb")` kb (`r bk("L3","n_block_snps")` SNPs, `r sum(block_genes$lead=="L3")` genes).
+  The second recurrent position (chr13:31616325) is in complete LD with it in BAM.
+* **L5 (chr7:13388648) is an APA lead, not a BAM lead.** In APA it tracks the manual label
+  (p = `r fmt(v("L5","fisher_allelic_manual_APA"))`), the classifier label
+  (p = `r fmt(v("L5","fisher_allelic_cls_APA"))`) and |vP0| (rho = `r round(v("L5","rho_abs_vP0_APA"),2)`,
+  p = `r fmt(v("L5","p_abs_vP0_APA"))`). The four manual wobbles that the classifier calls TP all carry
+  the ALT allele and have lower |vP0| than any manual TP. Inside the manual TP class alone, the
+  `r wi("L5","APA","TP","abs_vP0")$n_minor_carriers` carriers are the TPs with the lowest |vP0|
+  (rho = `r round(wi("L5","APA","TP","abs_vP0")$rho,2)`, p = `r fmt(wi("L5","APA","TP","abs_vP0")$p)`).
+  That is a label-independent signal. There is no dose-response among wobbles
+  (homozygotes vs hets: rho = `r round(wi("L5","APA","Wobble","abs_vP0")$rho,2)`). In BAM the allele is
+  rare (freq `r round(v("L5","af_BAM"),3)`) and unassociated.
+* **L1 (chr9) and L4 (chr3) pass the pre-set rule only at x5, not x30.**
+  L1 has no other SNP within +/-250 kb at r^2 >= 0.5 in BAM (max `r round(bk("L1","max_r2_other"),2)`),
+  although SNP density is high and the other leads have `r paste(range(blocks$n_block_snps[blocks$ld_pop == "BAM" & blocks$lead != "L1"]), collapse = "-")` partners in BAM. Its ALT allele is absent
+  from APA. Within manual BP fish its trait association runs opposite to the between-label effect
+  (repro rho = `r round(wi("L1","BAM","BP","repro")$rho,2)`). Treat it as a possible genotyping or mapping
+  artifact until read-level support is checked.
+  L4's classifier signal depends on the `r v("L4","n_minor_hom_BAM")` BP minor-allele homozygotes
+  (classifier p = `r fmt(v("L4","p_allelic_cls_BAM_drop_minor_hom"))` without them). Its block is large
+  (`r bk("L4","ext_1Mb_span_kb")` kb within +/-1 Mb) and sits in a gene desert (lncRNAs only; nearest
+  protein-coding gene `r gene_tab$nearest_protein_coding[gene_tab$lead=="L4"]`).
+* **L2 (chr4, colec12) is manual-label-only.** The wobble-associated allele is the one fixed in APA.
+* At L1, L2 and L4 the four manual-Wobble / classifier-BP fish carry the manual-wobble
+  genotype (table above), which is where the classifier tests lose power. With n = 4 this
+  cannot say which label is right.
+* `r if (all(hwe_tab$hwe_p >= 0.05, na.rm = TRUE)) "None of the tested SNPs deviates from Hardy-Weinberg (exact p < 0.05) within any group." else paste("HWE deviations (p < 0.05):", nrow(hw), "group x SNP rows; see table above.")`
+
+## Outputs
+
+```{r write}
+bprim <- blocks %>% inner_join(leads %>% select(lead, primary_pop), by = c("lead", "ld_pop" = "primary_pop"))
+bbam  <- blocks %>% filter(ld_pop == "BAM") %>%
+  transmute(lead, block_BAM = sprintf("%s-%s (%s kb, %s SNPs)", block_start, block_end, block_span_kb, n_block_snps))
+wwide <- within_tab %>% filter(role == "primary") %>%
+  transmute(lead, key = paste0("within_", pop, "_", within, "_", trait),
+            val = ifelse(is.na(rho), "NA", sprintf("rho %.2f p %s", rho, fmt(p)))) %>%
+  pivot_wider(names_from = key, values_from = val)
+summary_tab <- prim %>% left_join(bprim, by = "lead") %>% left_join(bbam, by = "lead") %>%
+  left_join(gene_tab, by = "lead") %>%
+  left_join(leads %>% select(lead, contrast, source_runs), by = "lead") %>%
+  transmute(lead, contrast, primary_pop, snp_used = snp, snp_note, ref = REF, alt = ALT,
+    af_BAM = round(af_BAM, 4), minor_allele_BAM = minor_BAM, af_APA = round(af_APA, 4),
+    geno_manual_BAM, geno_cls_BAM, geno_manual_APA, geno_cls_APA,
+    fisher_allelic_manual_p = signif(fisher_allelic_manual_BAM, 3),
+    fisher_allelic_manual_p_bonf = signif(fisher_allelic_manual_BAM_bonf, 3),
+    fisher_geno_manual_p = signif(fisher_geno_manual_BAM, 3),
+    fisher_geno_manual_p_bonf = signif(fisher_geno_manual_BAM_bonf, 3),
+    OR_alt_manual = round(OR_alt_manual_BAM, 3),
+    fisher_allelic_cls_p = signif(fisher_allelic_cls_BAM, 3),
+    fisher_allelic_cls_p_bonf = signif(fisher_allelic_cls_BAM_bonf, 3),
+    fisher_allelic_cls_p_bonf30 = signif(fisher_allelic_cls_BAM_bonf30, 3),
+    fisher_geno_cls_p = signif(fisher_geno_cls_BAM, 3),
+    fisher_geno_cls_p_bonf = signif(fisher_geno_cls_BAM_bonf, 3),
+    OR_alt_cls = round(OR_alt_cls_BAM, 3),
+    fisher_allelic_strict_p = signif(fisher_allelic_strict_BAM, 3),
+    spearman_rho_repro = round(rho_repro_BAM, 3), spearman_p_repro = signif(p_repro_BAM, 3),
+    spearman_p_repro_bonf = signif(p_repro_BAM_bonf, 3),
+    spearman_rho_abs_vP0 = round(rho_abs_vP0_BAM, 3), spearman_p_abs_vP0 = signif(p_abs_vP0_BAM, 3),
+    spearman_p_abs_vP0_bonf = signif(p_abs_vP0_BAM_bonf, 3),
+    APA_fisher_allelic_manual_p = signif(fisher_allelic_manual_APA, 3),
+    APA_fisher_allelic_manual_p_bonf = signif(fisher_allelic_manual_APA_bonf, 3),
+    APA_fisher_geno_manual_p = signif(fisher_geno_manual_APA, 3),
+    APA_OR_alt_manual = round(OR_alt_manual_APA, 3),
+    APA_fisher_allelic_cls_p = signif(fisher_allelic_cls_APA, 3),
+    APA_fisher_allelic_cls_p_bonf = signif(fisher_allelic_cls_APA_bonf, 3),
+    APA_fisher_allelic_cls_p_bonf30 = signif(fisher_allelic_cls_APA_bonf30, 3),
+    APA_fisher_geno_cls_p = signif(fisher_geno_cls_APA, 3),
+    APA_OR_alt_cls = round(OR_alt_cls_APA, 3),
+    APA_fisher_allelic_strict_p = signif(fisher_allelic_strict_APA, 3),
+    APA_spearman_rho_abs_vP0 = round(rho_abs_vP0_APA, 3), APA_spearman_p_abs_vP0 = signif(p_abs_vP0_APA, 3),
+    APA_spearman_p_abs_vP0_bonf = signif(p_abs_vP0_APA_bonf, 3),
+    APA_spearman_rho_repro = round(rho_repro_APA, 3), APA_spearman_p_repro = signif(p_repro_APA, 3),
+    reassigned_WobToBP, dosage_BAM_6494,
+    n_minor_hom_BAM, minor_hom_BAM,
+    p_allelic_manual_drop_minor_hom = signif(p_allelic_manual_BAM_drop_minor_hom, 3),
+    p_allelic_cls_drop_minor_hom = signif(p_allelic_cls_BAM_drop_minor_hom, 3),
+    p_allelic_manual_worst_LOO = signif(p_allelic_manual_BAM_worst_LOO, 3),
+    n_minor_hom_APA, minor_hom_APA,
+    ld_pop = ld_pop, block_start, block_end, block_span_kb, n_block_snps, block_at_window_edge,
+    max_r2_other = round(max_r2_other, 3), ext_1Mb_start, ext_1Mb_end, ext_1Mb_span_kb, ext_1Mb_n,
+    block_BAM, genes, lead_in_gene, nearest_gene, nearest_protein_coding,
+    verdict, robust_all_tests, reasoning, source_runs) %>%
+  left_join(wwide, by = "lead") %>%
+  relocate(starts_with("within_"), .after = p_allelic_manual_worst_LOO)
+fwrite(summary_tab, file.path(outdir, "leads_summary.tsv"), sep = "\t")
+fwrite(per_snp %>% mutate(across(where(is.numeric), ~ signif(.x, 4))),
+       file.path(outdir, "per_snp_tests.tsv"), sep = "\t")
+fwrite(within_tab %>% mutate(across(c(rho, p), ~ signif(.x, 4))),
+       file.path(outdir, "within_label_spearman.tsv"), sep = "\t")
+fwrite(hwe_tab %>% mutate(across(where(is.numeric), ~ signif(.x, 4))),
+       file.path(outdir, "hwe_by_group.tsv"), sep = "\t")
+fwrite(block_genes, file.path(outdir, "block_genes.tsv"), sep = "\t")
+for (i in seq_len(nrow(leads))) {
+  L <- leads[i, ]; tag <- paste0(L$lead, "_", L$chr, "_", L$pos)
+  pf <- per_fish %>% filter(lead == L$lead) %>%
+    select(lead, role, snp, REF, ALT, PN, pop, manual, stat_call, bin_manual, bin_cls,
+           n_sweeps, repro, abs_vP0, GT, dosage)
+  fwrite(pf, file.path(outdir, paste0(tag, ".genotypes.tsv")), sep = "\t")
+  cnts <- pf %>% pivot_longer(c(manual, stat_call), names_to = "label_set", values_to = "label") %>%
+    group_by(snp, role, pop, label_set, label) %>%
+    summarise(n = n(), homREF = sum(dosage == 0), het = sum(dosage == 1), homALT = sum(dosage == 2),
+              alt_freq = round(mean(dosage) / 2, 3), .groups = "drop") %>%
+    mutate(label_set = recode(label_set, stat_call = "classifier"))
+  fwrite(cnts, file.path(outdir, paste0(tag, ".genotype_counts.tsv")), sep = "\t")
+  fwrite(ld_all %>% filter(lead == L$lead) %>% mutate(r2 = round(r2, 4), maf = round(maf, 4)),
+         file.path(outdir, paste0(tag, ".ld_r2.tsv")), sep = "\t")
+}
+list.files(outdir)
+```
+
+```{r session}
+sessionInfo()$R.version$version.string
+system(paste(bcftools, "--version | head -1"), intern = TRUE)
+```

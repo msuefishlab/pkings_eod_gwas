@@ -1,0 +1,508 @@
+---
+title: "Wobble Multilocus Haplotype Validation Analysis (phased)"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+Post-GWAS analysis testing whether wobble/mixed EOD individuals carry noncanonical
+(recombinant) combinations of BP- and TP-associated **haplotypes** across the six known
+GWAS peaks. **This is NOT a GWAS**; it is a multilocus genotype validation analysis of six
+already-identified loci.
+
+Peak-to-origin mapping:
+
+  * Peaks 1/4/5 (chr6/chr16/chr17) = **Bambomo (BAM)** BP origin
+  * Peaks 2/3/6 (chr8/chr13/chr24) = other independent BP origins (negative control for BAM)
+
+**Design note.** The six peaks sit on six different chromosomes, so there is no cross-peak
+phase — "recombinant across peaks" means a noncanonical *combination* of independent
+per-peak diploid states. Phasing's value is *within* each peak: `01_call_peak_haplotypes.R`
+collapses each peak's LD block of SNPs into a single BP-vs-TP **haplotype-allele** call per
+chromosome copy (`peak_haplotype_states.csv`). It agrees with the index-SNP dosage state for
+~98% of calls (`peak_haplotype_concordance.csv`).
+
+**Scope.** Focal population = **Bambomo (BAM)** only: 41 BP, 25 Wobble, 1 TP. The primary
+statistical contrast is **BAM BP vs BAM Wobble**. External reference populations
+(APA/BEN/DOV/DOG TP; BIK/BAVA/BIR BP) are used only for haplotype-allele orientation,
+canonical-combination frequencies, and as visual anchors. `APA_223` is labelled `POP==BAM`,
+`Phenotype==Wobble` in the metadata and is retained as a BAM Wobble (part of the 25).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+root <- rprojroot::find_root(rprojroot::has_file(".git") | rprojroot::is_git_root)
+knitr::opts_knit$set(root.dir = root)
+library(tidyverse)
+library(data.table)
+library(patchwork)
+library(rstatix)
+library(ggpubr)
+
+outdir <- file.path(root, "output_data", "14_Wobble_Analysis", "PKINGS_WOB_MULTILOCUS")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# Shared aesthetics (peak_analysis conventions)
+state_colors <- c("BP_hom" = "#1ea8e0", "het" = "#9b6dc5",
+                  "TP_hom" = "#ed2224", "ambiguous" = "grey80")
+pheno_colors <- c("TP" = "#ed2224", "Wobble" = "#9b6dc5", "BP" = "#1ea8e0")
+
+# Collector for the consolidated statistics table (stats_summary.csv)
+stat_rows <- list()
+add_stat <- function(analysis, comparison, test, statistic, p, effect = NA, n = NA, note = "") {
+  stat_rows[[length(stat_rows) + 1]] <<- tibble(
+    analysis = analysis, comparison = comparison, test = test,
+    statistic = as.character(round(statistic, 4)),
+    p_value = signif(p, 3), effect_size = as.character(effect), n = n, note = note)
+}
+```
+
+# 1. Load data
+
+## 1a. Phased per-peak haplotype states
+
+Produced by `code/14_Wobble_Analysis/01_call_peak_haplotypes.R`. If missing, run that
+script first.
+
+```{r}
+states_path <- file.path(outdir, "peak_haplotype_states.csv")
+stopifnot(file.exists(states_path))
+states <- read.csv(states_path) %>%
+  # drop the phenotype/pop cols written by 01_call_peak_haplotypes.R so downstream
+  # joins add them cleanly (avoids Phenotype.x/.y collisions)
+  select(-any_of(c("POP", "Phenotype"))) %>%
+  mutate(peak_state = factor(peak_state,
+                             levels = c("BP_hom", "het", "TP_hom", "ambiguous")))
+
+peak_meta <- distinct(states, peak, chr, origin) %>% arrange(peak)
+peak_label_map <- setNames(sprintf("Peak %d\n(%s)", peak_meta$peak, peak_meta$chr),
+                           peak_meta$peak)
+cat("Peaks and origins:\n"); print(peak_meta)
+cat("\nAmbiguous calls (per peak):\n")
+print(states %>% filter(peak_state == "ambiguous") %>% count(peak))
+```
+
+## 1b. Sample metadata + EOD traits
+
+```{r}
+fish_path <- file.path(root, "input_data", "01_Terra", "data_model", "fish_data_2024a.txt")
+df.fish <- read.table(fish_path, header = TRUE, sep = "\t", quote = "") %>%
+  transmute(PN = trimws(PN), POP = trimws(POP), Phenotype = trimws(Phenotype))
+
+eod_path <- file.path(root, "output_data", "02_Phenotyping", "measurement_data.csv")
+df.eod <- read.csv(eod_path) %>%
+  transmute(PN = trimws(sample_name), aP0, aP1, vP0, vP1,
+            P0P1_ratio = aP0 / aP1)
+
+# BAM focal set
+bam_focal <- df.fish %>%
+  filter(POP == "BAM", Phenotype %in% c("BP", "Wobble", "TP")) %>%
+  mutate(Phenotype = factor(Phenotype, levels = c("TP", "Wobble", "BP")))
+cat("BAM focal counts:\n"); print(count(bam_focal, Phenotype))
+```
+
+# 2. Per-individual multilocus haplotype table
+
+```{r}
+# wide: one row per individual, six peak states + BP-hap counts + dosage scores
+wide_state <- states %>%
+  select(PN, peak, peak_state) %>%
+  pivot_wider(names_from = peak, values_from = peak_state, names_prefix = "peak_")
+wide_count <- states %>%
+  select(PN, peak, bp_hap_count) %>%
+  pivot_wider(names_from = peak, values_from = bp_hap_count, names_prefix = "bpN_")
+
+multi <- wide_state %>%
+  left_join(wide_count, by = "PN") %>%
+  left_join(df.fish, by = "PN") %>%
+  mutate(
+    # BP haplotype dosage scores (0-1): summed BP-hap count / 6
+    BAM_bp_score   = (bpN_1 + bpN_4 + bpN_5) / 6,   # Bambomo peaks
+    other_bp_score = (bpN_2 + bpN_3 + bpN_6) / 6    # control peaks
+  )
+
+write.csv(multi, file.path(outdir, "multilocus_peak_haplotype_wide.csv"), row.names = FALSE)
+cat(sprintf("Wrote multilocus_peak_haplotype_wide.csv: %d individuals x six peaks\n", nrow(multi)))
+
+multi %>% filter(POP == "BAM") %>%
+  select(PN, Phenotype, peak_1, peak_4, peak_5, peak_2, peak_3, peak_6,
+         BAM_bp_score, other_bp_score) %>%
+  arrange(Phenotype, desc(BAM_bp_score)) %>% head(15)
+```
+
+# 3. Q1/Q2 — Haplotype state at Bambomo peaks: are wobbles "partial BP"?
+
+## 3a. State distribution at BAM peaks (1/4/5) vs control peaks (2/3/6)
+
+```{r fig.width=9, fig.height=4}
+bam_states <- states %>%
+  inner_join(bam_focal %>% select(PN, Phenotype), by = "PN") %>%
+  mutate(peak_facet = factor(peak_label_map[as.character(peak)],
+                             levels = peak_label_map[order(as.integer(names(peak_label_map)))]))
+
+p_bam <- bam_states %>% filter(peak %in% c(1, 4, 5)) %>%
+  ggplot(aes(Phenotype, fill = peak_state)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = state_colors, name = "Haplotype state", drop = FALSE) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~peak_facet, nrow = 1) +
+  labs(title = "BP haplotype state at Bambomo-origin peaks (1/4/5)",
+       x = "Phenotype (BAM)", y = "Proportion") +
+  theme_bw(base_size = 12)
+print(p_bam)
+ggsave(file.path(outdir, "fig_stacked_bar_bam_peaks.svg"), p_bam, width = 9, height = 4)
+```
+
+```{r fig.width=9, fig.height=4}
+# Control: BAM individuals should be TP at peaks 2/3/6 (other origins).
+# Add BIK/BAVA/BIR BP as positive control that these peaks CAN carry BP haplotypes.
+other_bp <- df.fish %>% filter(POP %in% c("BIK", "BAVA", "BIR"), Phenotype == "BP")
+ctrl <- states %>%
+  filter(peak %in% c(2, 3, 6)) %>%
+  inner_join(bind_rows(bam_focal %>% select(PN, Phenotype) %>% mutate(grp = paste("BAM", Phenotype)),
+                       other_bp %>% transmute(PN, Phenotype, grp = "BIK/BAVA/BIR BP")),
+             by = "PN") %>%
+  mutate(grp = factor(grp, levels = c("BIK/BAVA/BIR BP", "BAM BP", "BAM Wobble", "BAM TP")),
+         peak_facet = factor(peak_label_map[as.character(peak)],
+                             levels = peak_label_map[order(as.integer(names(peak_label_map)))]))
+
+p_ctrl <- ggplot(ctrl, aes(grp, fill = peak_state)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = state_colors, name = "Haplotype state", drop = FALSE) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~peak_facet, nrow = 1) +
+  labs(title = "Control: BP haplotype state at other-origin peaks (2/3/6)",
+       x = NULL, y = "Proportion") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(p_ctrl)
+ggsave(file.path(outdir, "fig_stacked_bar_other_peaks_control.svg"), p_ctrl, width = 9, height = 4)
+```
+
+## 3b. Per-peak test — does the wobble class lose BP haplotypes at specific Bambomo peaks?
+
+For each Bambomo peak, Fisher exact test of Phenotype (BP vs Wobble) x carries ≥1 BP
+haplotype vs none.
+
+```{r}
+per_peak_fisher <- map_dfr(c(1, 4, 5), function(pk) {
+  d <- states %>% filter(peak == pk) %>%
+    inner_join(bam_focal %>% filter(Phenotype %in% c("BP", "Wobble")) %>%
+                 select(PN, Phenotype), by = "PN") %>%
+    mutate(carries_bp = if_else(bp_hap_count >= 1, "BP+", "BP0"))
+  tab <- table(factor(d$Phenotype, levels = c("BP", "Wobble")),
+               factor(d$carries_bp, levels = c("BP+", "BP0")))
+  ft <- fisher.test(tab)
+  add_stat("Q2 per-peak", sprintf("Peak %d: BP vs Wobble (carries BP hap)", pk),
+           "Fisher exact", ft$statistic %||% NA_real_, ft$p.value,
+           effect = round(unname(ft$estimate), 2), n = sum(tab))
+  tibble(peak = pk,
+         BP_carrier = tab["BP", "BP+"], BP_noncarrier = tab["BP", "BP0"],
+         Wob_carrier = tab["Wobble", "BP+"], Wob_noncarrier = tab["Wobble", "BP0"],
+         OR = round(unname(ft$estimate), 2), p = signif(ft$p.value, 3))
+})
+per_peak_fisher
+```
+
+# 4. Q4 — Does BP haplotype dosage track TP → Wobble → BP?
+
+`BAM_bp_score` = summed BP-haplotype count across Bambomo peaks 1/4/5 (range 0–1).
+Primary within-BAM contrast is BP vs Wobble (BAM TP n=1); an external APA/BEN TP reference
+band anchors the TP end for the ordered-trend test.
+
+```{r fig.width=5.5, fig.height=5}
+bam_score <- multi %>% filter(POP == "BAM") %>%
+  transmute(PN, Phenotype = factor(Phenotype, levels = c("TP", "Wobble", "BP")),
+            BAM_bp_score, group = "BAM")
+
+# External TP reference band (APA/BEN TP), scored at the same Bambomo peaks
+tp_ref_score <- multi %>%
+  filter(POP %in% c("APA", "BEN"), Phenotype == "TP") %>%
+  transmute(PN, Phenotype = factor("TP", levels = c("TP", "Wobble", "BP")),
+            BAM_bp_score, group = "TP ref (APA/BEN)")
+
+# --- Primary test: BAM BP vs BAM Wobble ---
+bp_wob <- bam_score %>% filter(Phenotype %in% c("BP", "Wobble"))
+wt <- wilcox.test(BAM_bp_score ~ Phenotype, data = bp_wob, exact = FALSE)
+add_stat("Q4 dosage", "BAM BP vs Wobble", "Wilcoxon rank-sum",
+         wt$statistic, wt$p.value, n = nrow(bp_wob))
+
+# --- Ordered trend TP(ref) < Wobble < BP (Jonckheere-Terpstra) ---
+trend_df <- bind_rows(tp_ref_score, bam_score %>% filter(Phenotype %in% c("Wobble", "BP")))
+jt <- DescTools::JonckheereTerpstraTest(BAM_bp_score ~ Phenotype, data = trend_df)
+add_stat("Q4 trend", "TP(ref) < Wobble < BP", "Jonckheere-Terpstra",
+         jt$statistic, jt$p.value, n = nrow(trend_df))
+
+cat("BAM BP vs Wobble Wilcoxon p =", signif(wt$p.value, 3), "\n")
+cat("Ordered trend (JT) p =", signif(jt$p.value, 3), "\n\n")
+bam_score %>% group_by(Phenotype) %>%
+  summarise(n = n(), median = median(BAM_bp_score), mean = round(mean(BAM_bp_score), 3),
+            .groups = "drop")
+
+plot_df <- bind_rows(bam_score, tp_ref_score) %>%
+  mutate(xgrp = factor(case_when(group == "TP ref (APA/BEN)" ~ "TP (ref)",
+                                 TRUE ~ as.character(Phenotype)),
+                       levels = c("TP (ref)", "TP", "Wobble", "BP")))
+p_score <- ggplot(plot_df, aes(xgrp, BAM_bp_score)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey40") +
+  geom_jitter(aes(colour = Phenotype), width = 0.15, size = 2, alpha = 0.75) +
+  scale_colour_manual(values = pheno_colors, guide = "none") +
+  labs(title = "BP haplotype dosage at Bambomo peaks (1+4+5)",
+       subtitle = sprintf("BAM BP vs Wobble Wilcoxon p = %.3g; ordered trend p = %.3g",
+                          wt$p.value, jt$p.value),
+       x = NULL, y = "BAM_bp_score (0–1)") +
+  theme_bw(base_size = 12)
+print(p_score)
+ggsave(file.path(outdir, "fig_bam_bp_score.svg"), p_score, width = 5.5, height = 5)
+```
+
+## 4b. Joint ordinal model (directional; small n)
+
+```{r}
+polr_df <- bam_score %>%
+  filter(Phenotype %in% c("Wobble", "BP")) %>%
+  left_join(multi %>% select(PN, bpN_1, bpN_4, bpN_5), by = "PN") %>%
+  mutate(Phenotype = factor(Phenotype, levels = c("Wobble", "BP"), ordered = TRUE))
+polr_fit <- tryCatch(MASS::polr(Phenotype ~ bpN_1 + bpN_4 + bpN_5, data = polr_df, Hess = TRUE),
+                     error = function(e) NULL)
+if (!is.null(polr_fit)) {
+  ct <- coef(summary(polr_fit))
+  cat("Ordinal logistic regression: Phenotype ~ BP-hap dosage at peaks 1/4/5 (BAM BP vs Wobble)\n")
+  cat("(directional interpretation only; n is small)\n\n")
+  print(round(ct, 3))
+} else cat("polr did not converge (expected with small n / separation); rely on Wilcoxon.\n")
+```
+
+# 5. Q3 — Multilocus concordance: are wobbles enriched for discordant combinations?
+
+A priori model over Bambomo peaks 1/4/5: collapse each peak to BP (≥1 BP haplotype) vs TP.
+
+  * **canonical BP** = BP at all three peaks
+  * **canonical TP** = TP at all three peaks
+  * **discordant/recombinant** = any mixture
+
+```{r}
+combo <- states %>%
+  filter(peak %in% c(1, 4, 5)) %>%
+  inner_join(bam_focal %>% select(PN, Phenotype), by = "PN") %>%
+  mutate(call = if_else(bp_hap_count >= 1, "BP", "TP")) %>%
+  select(PN, Phenotype, peak, call) %>%
+  pivot_wider(names_from = peak, values_from = call, names_prefix = "P") %>%
+  mutate(
+    combination = paste0("P1:", P1, " P4:", P4, " P5:", P5),
+    n_bp_peaks  = (P1 == "BP") + (P4 == "BP") + (P5 == "BP"),
+    class = case_when(n_bp_peaks == 3 ~ "canonical_BP",
+                      n_bp_peaks == 0 ~ "canonical_TP",
+                      TRUE ~ "discordant"))
+
+combo_table <- combo %>% count(Phenotype, combination, n_bp_peaks, class) %>%
+  arrange(Phenotype, desc(n_bp_peaks))
+write.csv(combo_table, file.path(outdir, "multilocus_combinations_table.csv"), row.names = FALSE)
+combo_table
+```
+
+```{r}
+# Enrichment of discordant combinations: BP vs Wobble
+disc_tab <- combo %>%
+  filter(Phenotype %in% c("BP", "Wobble")) %>%
+  mutate(disc = if_else(class == "discordant", "discordant", "canonical")) %>%
+  count(Phenotype, disc) %>%
+  pivot_wider(names_from = disc, values_from = n, values_fill = 0) %>%
+  column_to_rownames("Phenotype")
+disc_tab <- disc_tab[c("BP", "Wobble"), c("canonical", "discordant")]
+ft_disc <- fisher.test(as.matrix(disc_tab))
+add_stat("Q3 discordance", "BP vs Wobble (discordant vs canonical)", "Fisher exact",
+         ft_disc$statistic %||% NA_real_, ft_disc$p.value,
+         effect = round(unname(ft_disc$estimate), 2), n = sum(disc_tab))
+cat("2x2 (Phenotype x discordant):\n"); print(disc_tab)
+cat(sprintf("\nFisher exact: OR = %.2f, p = %.4g\n",
+            unname(ft_disc$estimate), ft_disc$p.value))
+```
+
+# 6. Q5 — Rare / "forbidden" multilocus combinations
+
+Do wobbles carry combinations that are uncommon in *both* canonical BP and canonical TP?
+Canonical pools: BAM BP (n=41) and TP references APA/BEN/DOV/DOG (n=66). For each Bambomo
+3-peak binary combination we compute its frequency in each pool using **leave-one-out**
+(a pool member is not counted toward its own combo frequency), then:
+
+  * `canonical_freq` = max(freq in BP pool, freq in TP pool)
+  * `rarity_score`   = −log10(canonical_freq + 1e-3)
+  * **forbidden**    = combination absent from both pools
+
+```{r}
+# 3-peak binary combo for ALL individuals (focal + reference pools)
+combo_all <- states %>% filter(peak %in% c(1, 4, 5)) %>%
+  mutate(call = if_else(bp_hap_count >= 1, "BP", "TP")) %>%
+  select(PN, peak, call) %>%
+  pivot_wider(names_from = peak, values_from = call, names_prefix = "P") %>%
+  mutate(combo = paste0(P1, P4, P5)) %>%
+  left_join(df.fish, by = "PN")
+
+bp_pool <- combo_all %>% filter(POP == "BAM", Phenotype == "BP")
+tp_pool <- combo_all %>% filter(POP %in% c("APA", "BEN", "DOV", "DOG"), Phenotype == "TP")
+n_bp <- nrow(bp_pool); n_tp <- nrow(tp_pool)
+bp_counts <- table(bp_pool$combo); tp_counts <- table(tp_pool$combo)
+
+rarity_of <- function(pn, combo, in_bp, in_tp) {
+  cb <- (if (!is.na(bp_counts[combo])) bp_counts[combo] else 0) - as.integer(in_bp)
+  ct <- (if (!is.na(tp_counts[combo])) tp_counts[combo] else 0) - as.integer(in_tp)
+  fb <- cb / max(n_bp - as.integer(in_bp), 1)
+  ftp <- ct / max(n_tp - as.integer(in_tp), 1)
+  canon <- max(fb, ftp)
+  tibble(canonical_freq = canon, rarity_score = -log10(canon + 1e-3),
+         forbidden = (cb == 0 & ct == 0))
+}
+
+bam_rar <- combo_all %>% filter(POP == "BAM", Phenotype %in% c("BP", "Wobble")) %>%
+  mutate(Phenotype = factor(Phenotype, levels = c("Wobble", "BP"))) %>%
+  rowwise() %>%
+  mutate(r = list(rarity_of(PN, combo,
+                            in_bp = (Phenotype == "BP"), in_tp = FALSE))) %>%
+  unnest(r) %>% ungroup()
+
+bam_rar %>% group_by(Phenotype) %>%
+  summarise(n = n(), mean_rarity = round(mean(rarity_score), 3),
+            n_forbidden = sum(forbidden), .groups = "drop")
+```
+
+```{r}
+# Descriptive Wilcoxon on rarity score, BP vs Wobble
+wt_r <- wilcox.test(rarity_score ~ Phenotype, data = bam_rar, exact = FALSE)
+add_stat("Q5 rarity", "BP vs Wobble (rarity score)", "Wilcoxon rank-sum",
+         wt_r$statistic, wt_r$p.value, n = nrow(bam_rar))
+
+# Label-permutation test: mean rarity(Wobble) - mean rarity(BP)
+set.seed(1)   # Date/random reproducibility
+obs <- with(bam_rar, mean(rarity_score[Phenotype == "Wobble"]) -
+                     mean(rarity_score[Phenotype == "BP"]))
+lab <- bam_rar$Phenotype
+nperm <- 10000
+perm <- replicate(nperm, {
+  s <- sample(lab)
+  mean(bam_rar$rarity_score[s == "Wobble"]) - mean(bam_rar$rarity_score[s == "BP"])
+})
+p_perm <- (1 + sum(perm >= obs)) / (nperm + 1)   # one-sided: wobbles more rare
+add_stat("Q5 rarity", "Wobble > BP rarity (permutation)", "label permutation (1-sided)",
+         obs, p_perm, n = nrow(bam_rar), note = sprintf("%d perms", nperm))
+
+# Forbidden-combination enrichment (Fisher)
+forb_tab <- bam_rar %>% count(Phenotype, forbidden) %>%
+  pivot_wider(names_from = forbidden, values_from = n, values_fill = 0)
+cat("Forbidden-combination counts by phenotype:\n"); print(forb_tab)
+cat(sprintf("\nRarity: Wilcoxon p = %.3g;  permutation (Wobble>BP) p = %.4g;  obs diff = %.3f\n",
+            wt_r$p.value, p_perm, obs))
+```
+
+```{r fig.width=9, fig.height=4}
+# Figure: (a) combination-class composition by phenotype; (b) rarity distribution
+pa <- combo %>%
+  mutate(class = factor(class, levels = c("canonical_TP", "discordant", "canonical_BP"))) %>%
+  ggplot(aes(Phenotype, fill = class)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c(canonical_TP = "#ed2224", discordant = "#f0a020",
+                               canonical_BP = "#1ea8e0"),
+                    name = "Multilocus class") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "(a) Multilocus class at peaks 1/4/5", x = "Phenotype (BAM)", y = "Proportion") +
+  theme_bw(base_size = 11)
+
+pb <- ggplot(bam_rar, aes(Phenotype, rarity_score, colour = Phenotype)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey40") +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.75) +
+  scale_colour_manual(values = pheno_colors, guide = "none") +
+  labs(title = "(b) Combination rarity",
+       subtitle = sprintf("perm p = %.3g", p_perm),
+       x = "Phenotype (BAM)", y = "rarity score (-log10 canonical freq)") +
+  theme_bw(base_size = 11)
+
+p_rar <- pa + pb
+print(p_rar)
+ggsave(file.path(outdir, "fig_combination_rarity.svg"), p_rar, width = 9, height = 4)
+```
+
+# 7. Q4b — EOD waveform traits vs BP haplotype dosage
+
+```{r fig.width=6, fig.height=5}
+eod_bam <- bam_score %>% left_join(df.eod, by = "PN") %>% filter(!is.na(aP0))
+cat(sprintf("BAM individuals with EOD data: %d\n", nrow(eod_bam)))
+
+sp_aP0  <- cor.test(eod_bam$BAM_bp_score, eod_bam$aP0, method = "spearman")
+sp_rat  <- cor.test(eod_bam$BAM_bp_score, eod_bam$P0P1_ratio, method = "spearman")
+add_stat("Q4b EOD", "BAM_bp_score vs aP0", "Spearman",
+         sp_aP0$statistic, sp_aP0$p.value, effect = round(unname(sp_aP0$estimate), 2),
+         n = nrow(eod_bam))
+add_stat("Q4b EOD", "BAM_bp_score vs P0/P1 ratio", "Spearman",
+         sp_rat$statistic, sp_rat$p.value, effect = round(unname(sp_rat$estimate), 2),
+         n = nrow(eod_bam))
+
+p_eod <- ggplot(eod_bam, aes(BAM_bp_score, aP0)) +
+  geom_smooth(method = "lm", se = TRUE, colour = "grey40", linetype = "dashed") +
+  geom_point(aes(colour = Phenotype), size = 2.5, alpha = 0.85) +
+  scale_colour_manual(values = pheno_colors) +
+  annotate("text", x = 0.05, y = max(eod_bam$aP0, na.rm = TRUE) * 0.95, hjust = 0, size = 3.5,
+           label = sprintf("Spearman rho = %.2f\np = %.3g", sp_aP0$estimate, sp_aP0$p.value)) +
+  labs(title = "P0 area (aP0) vs BP haplotype dosage",
+       x = "BAM_bp_score (peaks 1+4+5)", y = "aP0",
+       caption = "BAM only; directional, small n") +
+  theme_bw(base_size = 12)
+print(p_eod)
+ggsave(file.path(outdir, "fig_eod_vs_bp_score.svg"), p_eod, width = 6, height = 5)
+```
+
+# 8. Six-peak multilocus haplotype heatmap
+
+```{r fig.width=10, fig.height=8}
+focal_groups <- bind_rows(
+  bam_focal %>% transmute(PN, display_group = paste("BAM", Phenotype)),
+  df.fish %>% filter(POP %in% c("APA", "BEN"), Phenotype == "TP") %>%
+    transmute(PN, display_group = "APA/BEN TP"),
+  df.fish %>% filter(POP %in% c("BIK", "BAVA", "BIR"), Phenotype == "BP") %>%
+    transmute(PN, display_group = "BIK/BAVA/BIR BP")
+) %>%
+  mutate(display_group = factor(display_group,
+           levels = c("BIK/BAVA/BIR BP", "APA/BEN TP", "BAM TP", "BAM Wobble", "BAM BP")))
+
+order_score <- multi %>% transmute(PN, ord = BAM_bp_score)
+heat <- states %>%
+  inner_join(focal_groups, by = "PN") %>%
+  left_join(order_score, by = "PN") %>%
+  replace_na(list(ord = 0)) %>%
+  mutate(peak_facet = factor(paste("Peak", peak), levels = paste("Peak", 1:6))) %>%
+  arrange(display_group, desc(ord)) %>%
+  mutate(PN = factor(PN, levels = unique(PN)))
+
+p_heat <- ggplot(heat, aes(peak_facet, PN, fill = peak_state)) +
+  geom_tile(colour = "white", linewidth = 0.25) +
+  scale_fill_manual(values = state_colors, name = "Haplotype\nstate", drop = FALSE) +
+  facet_grid(display_group ~ ., scales = "free_y", space = "free_y") +
+  labs(title = "Multilocus haplotype states across six GWAS peaks",
+       subtitle = "Peaks 1/4/5 = Bambomo origin; 2/3/6 = other origins (control)",
+       x = "GWAS peak", y = "Individual") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        strip.text.y = element_text(size = 8, angle = 0),
+        panel.spacing = unit(0.1, "lines"))
+print(p_heat)
+ggsave(file.path(outdir, "fig_heatmap_all_peaks.svg"), p_heat, width = 10, height = 8)
+```
+
+# 9. Consolidated statistics + session info
+
+```{r}
+stats_summary <- bind_rows(stat_rows)
+write.csv(stats_summary, file.path(outdir, "stats_summary.csv"), row.names = FALSE)
+stats_summary
+```
+
+**Output files written to** `output_data/14_Wobble_Analysis/PKINGS_WOB_MULTILOCUS/`:
+`multilocus_peak_haplotype_wide.csv`, `multilocus_combinations_table.csv`,
+`stats_summary.csv` (and `peak_haplotype_allele_key.csv` from `01_call_peak_haplotypes.R`);
+figures `fig_heatmap_all_peaks.svg`, `fig_stacked_bar_bam_peaks.svg`,
+`fig_stacked_bar_other_peaks_control.svg`, `fig_bam_bp_score.svg`, `fig_eod_vs_bp_score.svg`,
+`fig_combination_rarity.svg`.
+
+```{r}
+sessionInfo()
+```

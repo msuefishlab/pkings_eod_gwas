@@ -1,0 +1,60 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH --time=03:00:00             # limit of wall clock time
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16g
+#SBATCH -J p0_gemma
+########## Command Lines to Run ##########
+
+# One GEMMA Wald scan of one column of BAM_P0.pheno (see 07_make_p0_phenos.R).
+# Array task 0 = the real phenotype; task k > 0 = permutation k (values shuffled
+# among the non-NA fish, NA positions kept). Permutations keep only the minimum
+# p_wald line. Reuses geno/map/kinship of the BAM_ONLY_BP0_TPWOB1 prep.
+# Expects exported: root, COL (1-based column), NAME (column name).
+
+cd $root
+source $root/config.env
+
+PERM=${SLURM_ARRAY_TASK_ID:-0}
+assoc=${root}/output_data/06_Association/BAM_ONLY_BP0_TPWOB1
+pheno_all=${root}/input_data/14_Wobble_Analysis/BAM_P0/BAM_P0.pheno
+outdir=${root}/output_data/14_Wobble_Analysis/BAM_P0/${NAME}
+tmp=${TMPDIR:-/tmp}/p0_${SLURM_JOB_ID}_${PERM}
+
+mkdir -p ${outdir}/perm ${tmp}
+
+cut -f${COL} ${pheno_all} > ${tmp}/col.pheno
+if [ ${PERM} -gt 0 ]; then
+  # Fisher-Yates shuffle of the non-NA values, seeded by column and permutation.
+  awk -v seed=$((COL * 1000 + PERM)) 'BEGIN{srand(seed)}
+    {v[NR]=$1; if($1!="NA"){k++; idx[k]=NR; val[k]=$1}}
+    END{for(i=k;i>1;i--){j=int(rand()*i)+1; t=val[i]; val[i]=val[j]; val[j]=t}
+        for(i=1;i<=k;i++) v[idx[i]]=val[i]; for(r=1;r<=NR;r++) print v[r]}' \
+    ${tmp}/col.pheno > ${tmp}/run.pheno
+else
+  cp ${tmp}/col.pheno ${tmp}/run.pheno
+fi
+
+singularity exec --bind ${root}:${root} --bind ${tmp}:${tmp} ${gwas_tools_image} \
+  /gemma/GEMMA/bin/gemma \
+  -g ${assoc}/BAM_ONLY_BP0_TPWOB1.geno \
+  -p ${tmp}/run.pheno \
+  -a ${assoc}/BAM_ONLY_BP0_TPWOB1_merge_map.txt \
+  -k ${assoc}/BAM_ONLY_BP0_TPWOB1.relate.cXX.txt \
+  -lmm 1 -maf 0.05 \
+  -outdir ${tmp} -o run
+
+if [ ${PERM} -eq 0 ]; then
+  mv ${tmp}/run.assoc.txt ${outdir}/${NAME}.lmm1.assoc.txt
+  mv ${tmp}/run.log.txt ${outdir}/${NAME}.lmm1.log.txt
+else
+  # column 12 = p_wald
+  awk 'NR==1{print; next} min=="" || $12 < min {min=$12; line=$0} END{print line}' \
+    ${tmp}/run.assoc.txt > ${outdir}/perm/perm_${PERM}.min.txt
+  mv ${tmp}/run.log.txt ${outdir}/perm/perm_${PERM}.log.txt
+fi
+
+rm -rf ${tmp}

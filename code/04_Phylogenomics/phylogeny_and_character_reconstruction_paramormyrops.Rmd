@@ -1,0 +1,533 @@
+---
+title: "Reconstruction of EOD Waveform Type Evolution in Paramormyrops kingsleyae using Parsimony, Stochastic Character Mapping and Joint Ancesteral Reconstruction"
+output: html_notebook
+params:
+  data_path: NULL
+  MAF_thresh: NULL  # passed by code/00_common/render_rmd_report.R; unused here
+  output_file: NULL
+---
+```{r setup, include=FALSE}
+root <- rprojroot::find_root(".git/index")
+knitr::opts_knit$set(root.dir = root)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(crop = TRUE)
+library(tidyverse)  # Includes ggplot2 and other data manipulation packages
+library(data.table)
+library(ape)
+library(phytools)
+library(castor)
+library(plotrix)
+library(corHMM)
+
+arctree <- function(tree,arc_height){
+h<-max(nodeHeights(tree))
+plotTree(tree, ftype = "i", lwd = 1, fsize = 0.8, type = "arc",arc_height=arc_height,ylim=c(-0.1*h,1.1*(1+arc_height)*h), offset=4)
+labs<-seq(0,6,by=.5)
+a1<-axis(1,pos=-0.02*h,at=h-labs+arc_height*h,
+  labels=labs,cex.axis=0.8,lwd=2,lend=2)
+text(mean(a1),-0.23*h,"million years bp",font=3)
+a2<-axis(1,pos=-0.02*h,at=-h+labs-arc_height*h,
+  labels=labs,cex.axis=0.8,lwd=2,lend=2)
+text(mean(a2),-0.23*h,"million years bp",font=3)
+draw.arc(0,0,radius=h-labs[2:length(labs)]+arc_height*h,
+  angle1=,angle2=pi,col=make.transparent("black",0.4),
+  lty="dotted")
+}
+```
+
+# Set up analysis
+Specify the paths for the various input phylogenetic trees and phenotypic data
+```{r}
+paramormyrops_tree_file<-file.path(root,"output_data/04_Phylogenomics/pkings_iqtree_genes_astral_gcf_scf_tree.cf.tree.nex")
+fish_data_file<-file.path(root,"input_data/01_Terra/data_model/fish_data_2024a.txt")
+treefile<-file.path(root,"input_data/04_Phylogenomics/ssAll_iqtree_timtree.tree")
+osteotree<-read.tree(treefile)
+osteotree<-osteotree$`UTREE1=`
+
+mormyrotree<-extract.clade(osteotree,220,root.edge=0,collapse.singles=TRUE)
+```
+
+```{r}
+paramormyrops_tree<-read.nexus(paramormyrops_tree_file)
+fish_data<-read.csv(fish_data_file,row.names=1,sep="\t")
+
+
+cf_stats_file<-file.path(root,"output_data/04_Phylogenomics/pkings_iqtree_genes_astral_gcf_scf_tree.cf.stat")
+cf_stats<-read.csv(cf_stats_file,sep="\t",comment.char = "#")
+
+concord_factors<-cf_stats[c("ID","gCF","sCF")]
+
+concord_factors <- concord_factors %>%
+    mutate(new_label = paste0("gCF:",concord_factors$gCF,"\nsCF:",concord_factors$sCF))
+
+cf_branch_file<-file.path(root,"output_data/04_Phylogenomics/pkings_iqtree_genes_astral_gcf_scf_tree.cf.branch")
+cf_branch<-read.tree(cf_branch_file)
+
+paramormyrops_tree$node.label<-cf_branch$node.label
+
+label_lookup <- setNames(concord_factors$new_label, as.character(concord_factors$ID))
+
+paramormyrops_tree$node.label<- sapply(paramormyrops_tree$node.label, function(x) {
+    new_label <- label_lookup[as.character(x)]
+    if(is.na(new_label)) return(x) else return(new_label)
+})
+
+pheno_discrete <- fish_data %>% 
+  mutate(Phenotype = factor(Phenotype)) %>%
+  dplyr::select(Phenotype)
+```
+
+Is there any missing samples between the phenotype file and the tree?
+```{r}
+phylo_samps<-paramormyrops_tree$tip.label
+pheno_discrete_samps<-rownames(pheno_discrete)
+setdiff(phylo_samps,pheno_discrete_samps)
+```
+
+# Clean Up Tree (MAYBE UNCESSERSARY?)
+
+For reasons that I can't really understand, joint reconstruction fails because of the long branches of PVAD_5505 AND PSZA_454.  So here, I'm going to drop PVAD_5505 and root the tree in PSZA_454.
+```{r}
+#paramormyrops_tree<-drop.tip(paramormyrops_tree, c("PHOP_5511","BIK_6898"), trim.internal = TRUE)
+paramormyrops_tree<-root(paramormyrops_tree,outgroup="PVAD_5505", resolve.root=TRUE)
+```
+
+# Let's get some calibration points from Peterson et al. Tree
+```{r}
+crown<-getMRCA(mormyrotree,c("Paramormyrops_kingsleyae_SRR6507961","Paramormyrops_batesii_CU79740B"))
+peterson_tree_paramormyrops<-extract.clade(mormyrotree,crown,root.edge=0,collapse.singles=TRUE)
+```
+
+```{r, fig.height=8}
+crown<-getMRCA(peterson_tree_paramormyrops,c("Paramormyrops_SN2_58_E05","Paramormyrops_batesii_CU79740B"))
+sza_mag<-getMRCA(peterson_tree_paramormyrops,c("Paramormyrops_mag_SRR9214510","Paramormyrops_SZA_58_H11"))
+sn2_cur<-getMRCA(peterson_tree_paramormyrops,c("Paramormyrops_SN2_58_E05","Paramormyrops_curvifrons_58_C01"))
+gab_mag<-getMRCA(peterson_tree_paramormyrops,c("Paramormyrops_gabonensis_64_C06","Paramormyrops_mag_SRR9214510"))
+hop_cur<-getMRCA(peterson_tree_paramormyrops,c("Paramormyrops_curvifrons_58_C01","Paramormyrops_hopkinsi_SRR9214432"))
+lon_sn2<-getMRCA(peterson_tree_paramormyrops,c("Paramormyrops_SN2_58_E05","Paramormyrops_longicaudatus_64_D10"))
+
+times<-branching.times(peterson_tree_paramormyrops)
+
+arctree(peterson_tree_paramormyrops,0.4)
+peterson_nodes<-c(crown,sza_mag,sn2_cur,gab_mag,hop_cur,lon_sn2)
+nodelabels(node=peterson_nodes, cex=1, frame="none", col="red")
+
+
+peterson_times<-times[as.character(peterson_nodes)]
+
+```
+```{r}
+peterson_times
+peterson_times_named<-peterson_times
+```
+```{r}
+crown<-getMRCA(paramormyrops_tree,c("PVAD_5505","PSN2_616"))
+sza_mag<-getMRCA(paramormyrops_tree,c("PSZA_454","PMAG_404"))
+sn2_cur<-getMRCA(paramormyrops_tree,c("PSN2_616","PCUR_538"))
+gab_mag<-getMRCA(paramormyrops_tree,c("PGAB_3980","PMAG_404"))
+hop_cur<-getMRCA(paramormyrops_tree,c("PCUR_538","PHOP_505"))
+lon_sn2<-getMRCA(paramormyrops_tree,c("PSN2_616","PLON_2190"))
+
+paramormyrops_nodes<-c(crown,sza_mag,sn2_cur,gab_mag,hop_cur,lon_sn2)
+
+paramormyrops_nodes
+```
+
+# Create a Time Calibrated Chronogram
+Estimates of crown age come from timetree.org and Peterson et al. 2023 phylogeny
+```{r}
+mycalibration=makeChronosCalib(paramormyrops_tree,node=paramormyrops_nodes,age.min=peterson_times,age.max=peterson_times)
+mycalibration
+```
+
+
+```{r}
+ultrametric_rooted_tree <- chronos(paramormyrops_tree, lambda = .1, model = "discrete", calibration = mycalibration, control = chronos.control(dual.iter.max=100) )
+```
+
+# Organize Phenotypes
+Need to categorize assigned phenotypes as TP and BP, and for now we are converting wobbles for illustrative purposes.
+```{r}
+phenos<-setNames(as.character(pheno_discrete$Phenotype), row.names(pheno_discrete))
+phenos <- gsub("TYPE_II", "TP", phenos)
+phenos <- gsub("TYPE_I", "TP", phenos)
+phenos<-as.factor(phenos)
+## set colors for plotting 
+
+newphenos<-phenos[paramormyrops_tree$tip.label]
+newphenos['APA_193']<-'TP'
+newphenos['BAM_165']<-'BP'
+newphenos<-droplevels(newphenos)
+cols<-setNames(c("blue","red"),levels(newphenos)) 
+```
+
+# View Extant Character Distribution on the Phylogeny
+```{r, fig.width=8}
+arctree(ultrametric_rooted_tree,0.4)
+tiplabels(pie=to.matrix(newphenos[ultrametric_rooted_tree$tip.label], levels(newphenos)), piecol=cols, cex=0.3)
+```
+# Using Parsimony to reconstruct character evolution.
+See pg. 251 of Revell & Harmon (2022) "Comparative Phylogenetic Comparative Methods in R" - assumes rate of evolution is very slow.
+```{r,fig.width=8}
+plot_name<-file.path(root,'output_data/04_Phylogenomics/paramormyrops_parsimony.svg')
+svg(plot_name, width=12)  # Adjust width as needed
+gp.int<-as.numeric(newphenos);
+names(gp.int)<-names(newphenos)  
+gp.int <- gp.int[match(ultrametric_rooted_tree$tip.label,names(gp.int))]
+anc.mp <- asr_max_parsimony(ultrametric_rooted_tree,gp.int)
+arctree(ultrametric_rooted_tree,0.4)
+tiplabels(pie=model.matrix(~as.factor(gp.int)-1),piecol=cols,cex=0.3)
+nodelabels(node=1:ultrametric_rooted_tree$Nnode+Ntip(ultrametric_rooted_tree),
+           pie=anc.mp$ancestral_likelihoods,piecol=cols,cex=0.3)
+#edgelabels()
+nodelabels(text=ultrametric_rooted_tree$node.label, adj=c(-.25,.25),frame="none",cex=0.5)
+n<-dev.off()  # Close the SVG device
+knitr::include_graphics(plot_name)
+```
+# Joint Character Estimation
+See pg. 238 Revell & Harmon (2022) "Comparative Phylogenetic Comparative Methods in R":
+In joint ancestral state reconstruction, what we do is ask which set of character values at all the internal nodes maximizes the probability of obtaining the values for the character that we’ve observed at the tips of the tree, given our model.
+
+Approach outlined here: http://blog.phytools.org/2024/04/a-few-useful-demos-on-ancestral-state.html
+```{r}
+## fit ER model 
+fitER<-fitMk(ultrametric_rooted_tree,newphenos,model="ER", pi=c(0,1),transform="delta") 
+## fit ARD model 
+fitARD<-fitMk(ultrametric_rooted_tree,newphenos,model="ARD",pi=c(0,1),transform="delta")
+## fit SYM model
+fitSYM<-fitMk(ultrametric_rooted_tree,newphenos,model="SYM",pi=c(0,1),transform="delta")
+
+## fit directional model
+directional<-matrix(c(0,0,1,0),2,2,byrow=TRUE)
+fitDIR<-fitMk(ultrametric_rooted_tree,newphenos,model=directional,pi=c(0,1),transform="delta")
+```
+
+
+```{r}
+## extract AIC values for each model 
+aic<-c(AIC(fitER),AIC(fitARD),AIC(fitSYM),AIC(fitDIR))
+## print summary table 
+
+model_summary<-data.frame(
+  model=c("ER","ARD","Symmetric","DIR"), 
+  logL=c(logLik(fitER),logLik(fitARD),logLik(fitSYM),logLik(fitDIR)), 
+  AIC=aic,delta.AIC=aic-min(aic),
+  weight=unclass(aic.w(aic)))
+
+model_summary
+```
+
+```{r, fig.width=4, fig.height=4}
+  plot(fitDIR, width=TRUE, color=TRUE, cex.rates=0.9, main="DIR Model")
+```
+
+
+```{r}
+mle.Q<-as.Qmatrix(fitDIR)
+mle.Q
+```
+
+
+```{r}
+system.time(mtrees.sc<-make.simmap(ultrametric_rooted_tree,newphenos,Q=mle.Q, nsim=1000,pi=c(0,1)))
+```
+
+```{r}
+pd<-summary(mtrees.sc)
+pd
+```
+```{r}
+dd<-density(mtrees.sc)
+dd
+```
+
+```{r, fig.width=4}
+
+names<-c("P. hopkinsii","P. hopkinsii","P. spp. 'MAG'", "P. gabonensis","P. spp 'SZA'","P. spp. 'VAD'","P. parsegnis","P. notomtom","P. curvifrons", "P. longicaudatus","P. spp. SN2", "Balé","Iboundji","Mengono","Mouvanga","Bikagala","Bikagala","Bavavela","Douvalou","Douengi","Biroundou","Bengue","Bambomo","Apassa")
+names(newphenos)<-names
+ultrametric_rooted_tree$tip.label<-names
+
+arctree <- function(tree,arc_height){
+h<-max(nodeHeights(tree))
+plotTree(tree, ftype = "i", lwd = 1, fsize = 1, type = "arc",arc_height=arc_height,ylim=c(-0.1*h,1.1*(1+arc_height)*h), offset=4)
+labs<-seq(0,6,by=.5)
+a1<-axis(1,pos=-0.02*h,at=h-labs+arc_height*h,
+  labels=labs,cex.axis=1.5,lwd=2,lend=2)
+text(mean(a1),-0.23*h,"million years bp",font=3)
+a2<-axis(1,pos=-0.02*h,at=-h+labs-arc_height*h,
+  labels=labs,cex.axis=1.5,lwd=2,lend=2)
+text(mean(a2),-0.23*h,"million years bp",font=3)
+draw.arc(0,0,radius=h-labs[2:length(labs)]+arc_height*h,
+  angle1=,angle2=pi,col=make.transparent("black",0.4),
+  lty="dotted")
+theme(text = element_text(family = "Arial"))  # <- font must be installed on both ends
+}
+
+
+plot_name<-file.path(root,'output_data/04_Phylogenomics/paramormyrops_character_map.svg')
+svg(plot_name, width=12, height=8)  # Adjust width as needed
+arctree(ultrametric_rooted_tree,0.4)
+arc.cladelabels(text="P. kingsleyae",node=findMRCA(ultrametric_rooted_tree,
+    c("Balé","Bambomo")),ln.offset=1.3,
+    lab.offset=1.4)
+arc.cladelabels(text="BP1",node=findMRCA(ultrametric_rooted_tree,
+    c("Bambomo","Apassa")),ln.offset=1.25,
+    lab.offset=1.3)
+arc.cladelabels(text="BP2",node=findMRCA(ultrametric_rooted_tree,
+    c("Bavavela","Bikagala")),ln.offset=1.25,
+    lab.offset=1.3)
+arc.cladelabels(text="BP3",node=findMRCA(ultrametric_rooted_tree,
+    c("Biroundou","Douengi")),ln.offset=1.25,
+    lab.offset=1.3)
+arc.cladelabels(text="BP4",node=findMRCA(ultrametric_rooted_tree,
+    c("Mengono","Iboundji")),ln.offset=1.25,
+    lab.offset=1.3)
+tiplabels(pie=to.matrix(newphenos[ultrametric_rooted_tree$tip.label], levels(newphenos)), piecol=cols, cex=0.3)
+nodelabels(node=1:ultrametric_rooted_tree$Nnode+Ntip(ultrametric_rooted_tree),
+           pie=pd$ace,piecol=cols,cex=0.4)
+nodelabels(node=1:ultrametric_rooted_tree$Nnode+Ntip(ultrametric_rooted_tree),
+           pie=pd$ace,piecol=cols,cex=0.4)
+#nodelabels(text=ultrametric_rooted_tree$node.label, adj=c(-.25,.25),frame="none",cex=0.5)
+n<-dev.off()  # Close the SVG device
+knitr::include_graphics(plot_name)
+```
+```{r, fig.width=4}
+
+# --- Data setup you already have ---
+names <- c("P. hopkinsii","P. hopkinsii","P. spp. 'MAG'", "P. gabonensis","P. spp 'SZA'",
+           "P. spp. 'VAD'","P. parsegnis","P. notomtom","P. curvifrons", "P. longicaudatus",
+           "P. spp. SN2", "Balé","Iboundji","Mengono","Mouvanga","Bikagala","Bikagala",
+           "Bavavela","Douvalou","Douengi","Biroundou","Bengue","Bambomo","Apassa")
+names(newphenos) <- names
+ultrametric_rooted_tree$tip.label <- names
+
+# Before drawing:
+par(xpd = NA, lend = "butt", ljoin = "mitre", lmitre = 10)
+
+arctree <- function(tree, arc_height) {
+  h <- max(nodeHeights(tree))
+  plotTree(
+    tree, ftype = "i", lwd = 1, fsize = 1,
+    type = "arc", arc_height = arc_height,
+    ylim = c(-0.1 * h, 1.1 * (1 + arc_height) * h),
+    offset = 4
+  )
+
+  labs <- seq(0, 6, by = .5)
+
+  a1 <- axis(1, pos = -0.02*h, at = h - labs + arc_height*h,
+             labels = labs, cex.axis = 1.5, lwd = 2)
+  text(mean(a1), -0.23*h, "million years bp", font = 3)
+
+  a2 <- axis(1, pos = -0.02*h, at = -h + labs - arc_height*h,
+             labels = labs, cex.axis = 1.5, lwd = 2)
+  text(mean(a2), -0.23*h, "million years bp", font = 3)
+
+  # ---- draw time arcs as SINGLE paths, no transparency ----
+  arc_radii <- h - labs[-1] + arc_height*h  # skip the zero tick
+  for (r in arc_radii) {
+    theta <- seq(0, pi, length.out = 600)   # smooth arc
+    x <- r * cos(theta)
+    y <- r * sin(theta)
+    lines(x, y, col = "grey55", lwd = 1, lty = 2)  # dashed style, single path
+  }
+}
+
+
+# --- Export as Illustrator-friendly PDF ---
+plot_name <- file.path(root, "output_data/04_Phylogenomics/paramormyrops_character_map.pdf")
+
+# Use cairo_pdf to embed TrueType fonts; set default base font here
+grDevices::cairo_pdf(
+  filename = plot_name,
+  width = 12, height = 8,
+  family = "Arial",   # change to "Helvetica" or another installed font if you prefer
+  bg = "transparent"
+)
+
+# (Optional) extra safety: set base family for this device explicitly
+op <- par(family = "Arial")
+
+# --- Draw ---
+arctree(ultrametric_rooted_tree, 0.4)
+
+arc.cladelabels(
+  text = "P. kingsleyae",
+  node = findMRCA(ultrametric_rooted_tree, c("Balé","Bambomo")),
+  ln.offset = 1.3, lab.offset = 1.4
+)
+arc.cladelabels(
+  text = "BP1",
+  node = findMRCA(ultrametric_rooted_tree, c("Bambomo","Apassa")),
+  ln.offset = 1.25, lab.offset = 1.3
+)
+arc.cladelabels(
+  text = "BP2",
+  node = findMRCA(ultrametric_rooted_tree, c("Bavavela","Bikagala")),
+  ln.offset = 1.25, lab.offset = 1.3
+)
+arc.cladelabels(
+  text = "BP3",
+  node = findMRCA(ultrametric_rooted_tree, c("Biroundou","Douengi")),
+  ln.offset = 1.25, lab.offset = 1.3
+)
+arc.cladelabels(
+  text = "BP4",
+  node = findMRCA(ultrametric_rooted_tree, c("Mengono","Iboundji")),
+  ln.offset = 1.25, lab.offset = 1.3
+)
+
+tiplabels(
+  pie = to.matrix(newphenos[ultrametric_rooted_tree$tip.label], levels(newphenos)),
+  piecol = cols, cex = 0.3
+)
+
+# (You had nodelabels twice; keeping one call)
+nodelabels(
+  node = 1:ultrametric_rooted_tree$Nnode + Ntip(ultrametric_rooted_tree),
+  pie = pd$ace, piecol = cols, cex = 0.4
+)
+
+par(op)
+dev.off()
+
+# You can still inline the PDF in knitr:
+knitr::include_graphics(plot_name)
+```
+```{r, fig.height=8}
+
+## ---- Data you already have ----
+# Rename (as in your example)
+names <- c("P. hopkinsii","P. hopkinsii","P. spp. 'MAG'", "P. gabonensis","P. spp 'SZA'",
+           "P. spp. 'VAD'","P. parsegnis","P. notomtom","P. curvifrons", "P. longicaudatus",
+           "P. spp. SN2", "Balé","Iboundji","Mengono","Mouvanga","Bikagala","Bikagala",
+           "Bavavela","Douvalou","Douengi","Biroundou","Bengue","Bambomo","Apassa")
+names(newphenos) <- names
+ultrametric_rooted_tree$tip.label <- names
+
+add_cladelabel <- function(tree, tips, label, offset = 0.03, cex = 1, col = "black", font = 3, line = TRUE) {
+  n <- findMRCA(tree, tips)
+  # coordinates of MRCA node
+  xx <- nodeHeights(tree)[which(tree$edge[,2] == n), 2]
+  yy <- mean(get("last_plot.phylo", envir = .PlotPhyloEnv)$yy[tree$edge[tree$edge[,2] == n, 2]])
+  # convert offset from fraction of tree height to actual x-units
+  h <- max(nodeHeights(tree))
+  x_off <- offset * h
+  if (line) {
+    lines(x = c(xx, xx + x_off*0.5), y = c(yy, yy), lty = 1, col = col, lwd = 1)
+  }
+  text(x = xx + x_off, y = yy, labels = label, pos = 4, cex = cex, col = col, font = font)
+}
+
+
+# --- Helper: draw a standard phylogram with time axis & pies ---
+draw_phylogram <- function(tree,
+                           newphenos,
+                           cols,
+                           node_pies,       # e.g., pd$ace
+                           family = "Arial",
+                           base_cex = 1,
+                           tick_by = 0.5) {
+
+  # Tree height (in the same units as branch lengths; assumed Myr)
+  h <- max(nodeHeights(tree))
+
+  # Open Cairo-PDF (fonts embedded; text stays editable)
+  plot_name <- file.path(root, "output_data/04_Phylogenomics/paramormyrops_character_map_phylogram.pdf")
+  grDevices::cairo_pdf(plot_name, width = 6, height = 12, family = family, bg = "transparent")
+
+  # Graphics params to reduce fragmentation in Illustrator
+  op <- par(xpd = NA, lend = "butt", ljoin = "mitre", lmitre = 10, family = family, cex = base_cex)
+
+  # Plot standard rectangular phylogram
+  # ftype="i" -> italic tip labels; adjust as you like ("reg" for regular)
+ h <- max(nodeHeights(tree))
+plotTree(tree,
+  type = "phylogram",
+  ftype = "i",
+  fsize = 1,
+  lwd = 1,
+  direction = "rightwards",
+  offset = 0.1,
+  x.lim = c(0, h * 1.05),
+  mar = c(6, 2, 2, 2)
+)
+
+
+  # ---- Time axis (Myr before present) ----
+  # We want labels increasing to the LEFT (root older), 0 at the RIGHT (tips).
+  labs <- seq(0, ceiling(h), by = tick_by)           # tick labels (0..h)
+  at_x <- h - labs                                   # positions in plot coords
+  # Vertical dashed guides (single abline per tick -> easy to restyle later)
+  for (vx in at_x) abline(v = vx, lty = 2, lwd = 1, col = "grey55")
+
+  # Bottom axis: place ticks at at_x, label with labs (0 at right)
+  axis(1, at = at_x, labels = labs, lwd = 2, cex.axis = 1.2)
+  mtext("million years bp", side = 1, line = 3.5, font = 3, cex = 1.1)
+
+  # ---- Clade labels (rectangular brackets + text) ----
+  # Use phytools::cladelabels and findMRCA just like your arc version
+add_cladelabel(tree, c("Balé","Bambomo"), "P. kingsleyae", offset = 0.03, cex = 1.1)
+add_cladelabel(tree, c("Bambomo","Apassa"), "BP1", offset = 0.03)
+add_cladelabel(tree, c("Bavavela","Bikagala"), "BP2", offset = 0.03)
+add_cladelabel(tree, c("Biroundou","Douengi"), "BP3", offset = 0.03)
+add_cladelabel(tree, c("Mengono","Iboundji"), "BP4", offset = 0.03)
+
+
+
+  # ---- Tip pies ----
+  tiplabels(
+    pie = to.matrix(newphenos[tree$tip.label], levels(newphenos)),
+    piecol = cols, cex = .8
+  )
+
+  # ---- Node pies (ancestral states) ----
+  nodelabels(
+    node = 1:tree$Nnode + Ntip(tree),
+    pie = node_pies, piecol = cols, cex = 1
+  )
+
+  par(op)
+  dev.off()
+
+  # For knitr inline preview (optional)
+  # knitr::include_graphics(plot_name)
+
+  return(invisible(plot_name))
+}
+
+# ---- Call it ----
+out_pdf <- draw_phylogram(
+  tree      = ultrametric_rooted_tree,
+  newphenos = newphenos,
+  cols      = cols,
+  node_pies = pd$ace,
+  family    = "Arial",     # ensure installed on both systems; or "Helvetica" on macOS
+  base_cex  = 1.0,
+  tick_by   = 0.5
+)
+
+cat("Wrote:", out_pdf, "\n")
+
+```
+
+```{r}
+plotTree(tree,type="fan",fsize=0.8,xlim=c(-4.1,4.1))
+arc.cladelabels(text="clade C",node=which(tree$tip.label=="t8"),
+    orientation="horizontal",ln.offset=1.1,lab.offset=1.12)
+## with our other labels:
+arc.cladelabels(text="clade A",node=findMRCA(tree,
+    c("t63","t64","t47","t48","t43","t44")),ln.offset=1.1,
+    lab.offset=1.16)
+arc.cladelabels(text="clade B",node=findMRCA(tree,c("t46","t19")),
+    ln.offset=1.1,lab.offset=1.16)
+```
+
+
+```{r}
+ggplot(concord_factors,aes(x=gCF,y=sCF))+
+  geom_point() + 
+  xlim(0, 100) +
+    ylim(0, 100) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed")
+```

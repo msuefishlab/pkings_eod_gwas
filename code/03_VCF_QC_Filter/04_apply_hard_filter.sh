@@ -1,0 +1,21 @@
+## 04_apply_hard_filter.sh
+## 12-03-23
+## JRG
+## Submits hard filtering to queue, scattered over chromosome intervals
+
+#!/bin/bash
+
+root="$(git rev-parse --show-toplevel)"
+source ${root}/"config.env"
+
+interval_files=($(find "${root}/input_data/01_Terra/chrom-interval-files/" "${root}/input_data/01_Terra/remaining-interval-files/" -type f))
+
+nintervals=${#interval_files[@]}
+
+mkdir -p $root"/output_data/slurm_logs"/03_QC/
+
+echo sbatch --job-name "QC_FILTER_SNPS" --output ${root}"/output_data/slurm_logs"/03_QC/"qc_filter_snps_%a.log" -a 0-$nintervals --export=root=${root},vartype="SNP" ${root}/code/03_VCF_QC_Filter/apply_hard_filter.sb
+sbatch --job-name "QC_FILTER_SNPS" --output ${root}"/output_data/slurm_logs"/03_QC/"qc_filter_snps_%a.log" -a 0-$nintervals --export=root=${root},vartype="SNP" ${root}/code/03_VCF_QC_Filter/apply_hard_filter.sb
+
+echo sbatch --job-name "QC_FILTER_INDELS" --output ${root}"/output_data/slurm_logs"/03_QC/"qc_filter_indels_%a.log" -a 0-$nintervals --export=root=${root},vartype="INDEL" ${root}/code/03_VCF_QC_Filter/apply_hard_filter.sb
+sbatch --job-name "QC_FILTER_SNPS" --output ${root}"/output_data/slurm_logs"/03_QC/"qc_filter_indels_%a.log" -a 0-$nintervals --export=root=${root},vartype="INDEL" ${root}/code/03_VCF_QC_Filter/apply_hard_filter.sb

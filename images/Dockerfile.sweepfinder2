@@ -1,0 +1,49 @@
+FROM ubuntu:22.04
+
+LABEL maintainer="Jason Gallant Lab"
+LABEL version="1.0"
+LABEL description="SweepFinder2 for genome-wide selective sweep detection"
+
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LC_ALL=C
+ENV PATH="/opt/SF2:${PATH}"
+
+# Update and install dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    wget \
+    zlib1g-dev \
+    libbz2-dev \
+    liblzma-dev \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    bcftools \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install SweepFinder2
+WORKDIR /opt
+RUN wget https://degiorgiogroup.fau.edu/SF2.tar.gz && \
+    tar -xzvf SF2.tar.gz && \
+    cd SF2 && \
+    sed -i 's/-O3 -Wall/-O3 -Wall -fcommon/g' Makefile && \
+    make && \
+    chmod +x SweepFinder2 && \
+    rm ../SF2.tar.gz
+
+# Install Python packages for data conversion
+RUN pip3 install --no-cache-dir numpy pandas
+
+# Test installations
+RUN SweepFinder2 -h || true && \
+    bcftools --version && \
+    python3 --version && \
+    python3 -c "import numpy; import pandas; print('Python packages OK')"
+
+# Set working directory
+WORKDIR /data
+
+# Default command
+CMD ["SweepFinder2"]

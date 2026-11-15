@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH --job-name=ext_xpnsl_rows
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=24G
+#SBATCH --time=03:59:00
+#SBATCH --output=output_data/slurm_logs/11_Drift_vs_Selection/ext_xpnsl_rows_%A_%a.out
+## Two sweep-evidence sensitivity rows of Table S5: the extended peak interval, and XP-nSL in place of Rsb.
+##   tasks 0-5  whole-peak row, one peak per task (peak = task + 1): the extended interval
+##              replaces the search region and the window, so each peak has its own operator
+##              and its own null (02_region_stats.R / 02b_region_callable.R --interval_peak).
+##   task 6     XP-nSL in place of Rsb, headline operator and null. Needs
+##              ehh/xpnsl/<BP>.genome_wide.txt.gz (ehh/17_xpnsl_array.sb, then 17b_xpnsl_merge.py).
+##   task 7     regression check: the headline matrix rebuilt by 03_evidence_matrix.R with these
+##              options available must equal evidence_matrix.tsv.
+## Outputs carry the suffixes _ext<k> and _xpnsl, so no existing row is overwritten.
+##   sbatch --array=0-5 --export=root=$(pwd) code/11_Drift_vs_Selection/sweep_detection/evidence/08_ext_and_xpnsl.sb
+##   sbatch --array=6   --export=root=$(pwd) code/11_Drift_vs_Selection/sweep_detection/evidence/08_ext_and_xpnsl.sb
+
+set -euo pipefail
+cd "${root}"
+source "${root}/config.env"
+ev=code/11_Drift_vs_Selection/sweep_detection/evidence
+sx() { singularity exec --bind "${scratch_dir}" "${gwas_tools_image}" "$@"; }
+
+t=${SLURM_ARRAY_TASK_ID}
+if (( t <= 5 )); then
+  k=$((t + 1))
+  echo "=== whole-peak row, peak ${k}"
+  sx Rscript ${ev}/02_region_stats.R --interval_peak ${k} --stats rsb,clr,pi_ratio
+  sx Rscript ${ev}/02b_region_callable.R --interval_peak ${k}
+  sx Rscript ${ev}/03_evidence_matrix.R --suffix _ext${k} --only_peak ${k}
+elif (( t == 7 )); then
+  echo "=== regression check of 03_evidence_matrix.R"
+  sx Rscript ${ev}/03_evidence_matrix.R --out_suffix _regcheck
+  d=output_data/11_Drift_vs_Selection/sweep_detection/evidence
+  cmp ${d}/evidence_matrix.tsv ${d}/evidence_matrix_regcheck.tsv && cmp ${d}/calibration.tsv ${d}/calibration_regcheck.tsv \
+    && echo "REGRESSION OK" || { echo "REGRESSION FAILED"; exit 1; }
+else
+  echo "=== XP-nSL row"
+  sx Rscript ${ev}/02_region_stats.R --stats rsb,clr,pi_ratio,xpnsl --suffix _xpnsl
+  sx Rscript ${ev}/03_evidence_matrix.R --suffix _xpnsl --primary xpnsl,clr,pi_ratio
+fi

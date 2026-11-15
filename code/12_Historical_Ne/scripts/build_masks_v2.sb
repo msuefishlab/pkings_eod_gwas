@@ -1,0 +1,102 @@
+#!/bin/bash --login
+#SBATCH --account=general
+#SBATCH --partition=general-short
+#SBATCH --cpus-per-task=26
+#SBATCH --mem=64G
+#SBATCH --time=03:50:00
+#SBATCH -J smcpp_masks_v2
+#SBATCH -o output_data/slurm_logs/12_Historical_Ne/build_masks_v2_%j.log
+
+# build_masks_v2.sb — callability-corrected smc++ masks (masks_v2).
+#
+# Why: positions ABSENT from the all-sites VCF are read by vcf2smc as homozygous
+# reference unless masked. 14.15% of chr1-25 (125.7 Mb) is absent, while the
+# original masks (build_masks.py) cover only ~1.8%. masks_v2 = original per-pop
+# mask UNION all VCF-absent intervals (~15.8% of the genome per population).
+#
+# Working tree: ${SMCPP_WORK:-${scratch_dir}/smcpp} (called WORK below).
+# Inputs: WORK/data/vcf_by_chr/chr*.vcf.gz and the original per-population masks in
+# WORK/masks/<POP>.mask.bed.gz (keep them; masks_v2 is built on top of them).
+# Outputs: WORK/audit/{covered,uncovered}/, callability_by_chr.tsv,
+# vcf_absent_all.bed, masks_v2/<POP>.mask.bed.gz(.tbi), mask_comparison.tsv.
+#
+# Submit from the repository root:
+#   source config.env
+#   mkdir -p output_data/slurm_logs/12_Historical_Ne
+#   sbatch code/12_Historical_Ne/scripts/build_masks_v2.sb
+
+set -euo pipefail
+module load BCFtools/1.18-GCC-12.3.0
+module load BEDTools 2>/dev/null || true
+
+REPO=$SLURM_SUBMIT_DIR
+cd "$REPO" && source config.env
+WORK=${SMCPP_WORK:-${scratch_dir}/smcpp}
+AUDIT=$WORK/audit
+mkdir -p $AUDIT/covered $AUDIT/uncovered $AUDIT/masks_v2
+
+FAI=$REPO/input_data/00_Reference_Genome/jordan-mic4273-mb-hirise-20xx3__06-13-2024__final_assembly.fasta.renamed.fa.fai
+awk '$1 ~ /^chr([1-9]|1[0-9]|2[0-5])$/ {print $1"\t"$2}' $FAI | sort -k1,1 > $AUDIT/genome.txt
+
+do_chr() {
+  CHR=$1
+  VCF=$WORK/data/vcf_by_chr/${CHR}.vcf.gz
+  [ -f "$VCF" ] || { echo "[$CHR] MISSING VCF"; return 0; }
+  bcftools query -f '%CHROM\t%POS0\t%POS\n' "$VCF" \
+    | bedtools merge -i - > $AUDIT/covered/${CHR}.bed
+  grep -P "^${CHR}\t" $AUDIT/genome.txt > $AUDIT/covered/${CHR}.genome
+  bedtools complement -i $AUDIT/covered/${CHR}.bed -g $AUDIT/covered/${CHR}.genome \
+    > $AUDIT/uncovered/${CHR}.bed
+  COV=$(awk '{s+=$3-$2} END {print s+0}' $AUDIT/covered/${CHR}.bed)
+  UNC=$(awk '{s+=$3-$2} END {print s+0}' $AUDIT/uncovered/${CHR}.bed)
+  NGAP=$(wc -l < $AUDIT/uncovered/${CHR}.bed)
+  MAXGAP=$(awk '{d=$3-$2; if(d>m) m=d} END {print m+0}' $AUDIT/uncovered/${CHR}.bed)
+  LEN=$(cut -f2 $AUDIT/covered/${CHR}.genome)
+  echo -e "${CHR}\t${LEN}\t${COV}\t${UNC}\t${NGAP}\t${MAXGAP}" >> $AUDIT/callability_by_chr.tsv
+  echo "[$CHR] len=$LEN covered=$COV uncovered=$UNC gaps=$NGAP maxgap=$MAXGAP"
+}
+export -f do_chr
+export WORK AUDIT
+
+rm -f $AUDIT/callability_by_chr.tsv
+printf 'chrom\tlength\tcovered_bp\tuncovered_bp\tn_gaps\tmax_gap_bp\n' > $AUDIT/callability_by_chr.tsv
+printf 'chr%d\n' $(seq 1 25) | xargs -P 25 -I{} bash -c 'do_chr "$@"' _ {}
+
+echo ""
+echo "=== GENOME-WIDE CALLABILITY SUMMARY ==="
+awk -F'\t' 'NR>1 {L+=$2; C+=$3; U+=$4; G+=$5} END {
+  printf "total_length_bp    = %d (%.1f Mb)\n", L, L/1e6;
+  printf "covered_by_vcf_bp  = %d (%.1f Mb, %.2f%%)\n", C, C/1e6, 100*C/L;
+  printf "ABSENT_from_vcf_bp = %d (%.1f Mb, %.2f%%)\n", U, U/1e6, 100*U/L;
+  printf "n_gap_intervals    = %d\n", G;
+}' $AUDIT/callability_by_chr.tsv
+
+# gap length distribution
+echo ""
+echo "=== GAP LENGTH DISTRIBUTION (all chromosomes) ==="
+cat $AUDIT/uncovered/chr*.bed | awk '{d=$3-$2;
+  if(d==1)a++; else if(d<=10)b++; else if(d<=100)c++; else if(d<=1000)e++;
+  else if(d<=10000)f++; else g++; tot+=d; n++}
+  END {printf "1bp=%d  2-10=%d  11-100=%d  101-1k=%d  1k-10k=%d  >10k=%d\n",a,b,c,e,f,g;
+       printf "n_intervals=%d  total_bp=%d  mean_gap=%.1f\n", n, tot, tot/n}'
+
+echo ""
+echo "=== Building corrected masks (v2 = old UNION vcf-absent) ==="
+cat $AUDIT/uncovered/chr*.bed | sort -k1,1 -k2,2n | bedtools merge -i - > $AUDIT/vcf_absent_all.bed
+
+printf 'pop\told_mask_bp\told_pct\tnew_mask_bp\tnew_pct\n' > $AUDIT/mask_comparison.tsv
+for POP in BAM BIK BAVA BIR APA_2009 BEN DOV DOG; do
+  zcat $WORK/masks/${POP}.mask.bed.gz > $AUDIT/masks_v2/${POP}.old.bed
+  OLDBP=$(awk '{s+=$3-$2} END {print s+0}' $AUDIT/masks_v2/${POP}.old.bed)
+  cat $AUDIT/masks_v2/${POP}.old.bed $AUDIT/vcf_absent_all.bed \
+    | sort -k1,1 -k2,2n | bedtools merge -i - > $AUDIT/masks_v2/${POP}.mask.bed
+  NEWBP=$(awk '{s+=$3-$2} END {print s+0}' $AUDIT/masks_v2/${POP}.mask.bed)
+  bgzip -f $AUDIT/masks_v2/${POP}.mask.bed
+  tabix -f -p bed $AUDIT/masks_v2/${POP}.mask.bed.gz
+  rm -f $AUDIT/masks_v2/${POP}.old.bed
+  awk -v p=$POP -v o=$OLDBP -v n=$NEWBP 'BEGIN{printf "%s\t%d\t%.2f\t%d\t%.2f\n", p, o, 100*o/888337685, n, 100*n/888337685}' \
+    >> $AUDIT/mask_comparison.tsv
+done
+cat $AUDIT/mask_comparison.tsv
+
+exit 0

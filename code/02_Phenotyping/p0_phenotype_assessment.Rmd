@@ -1,0 +1,334 @@
+---
+title: "Quantitative assessment of EOD P0 phenotype assignments"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  data_dir: "output_data/02_Phenotyping"
+  fish_data: "input_data/01_Terra/data_model/fish_data_2024a.txt"
+  species: "Paramormyrops kingsleyae"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5)
+root <- rprojroot::find_root(".git/index")
+knitr::opts_knit$set(root.dir = root)
+
+library(tidyverse)
+library(data.table)
+
+have <- function(pkg) requireNamespace(pkg, quietly = TRUE)
+```
+
+# Purpose
+
+BP / TP / "wobble" EOD categories are assigned **by eye**. The question is whether
+individual assignments can be put on a quantitative footing — specifically the
+**wobble**, which is a BP-shaped waveform (large P1/P2) carrying a *distinct but
+very small* third phase (P0) right before the P1 upswing.
+
+Two facts shape the method:
+
+- **P0 magnitude is population-confounded.** Absolute P0 size varies several-fold
+  among populations for reasons outside this phenotype, so a global magnitude
+  threshold (area `aP0`, prominence) does **not** separate wobble from BP.
+- **The wobble signal is shape + consistency, not size.** A real P0 is a
+  *localized* dip that recurs *at the same place across replicate sweeps*, even
+  when each sweep is near the noise floor.
+
+So we score P0 on two axes, within *P. kingsleyae* only:
+
+1. **Presence** — an amplitude-invariant shape score (matched filter vs a small-dip
+   template), judged against each population's own BP fish as the noise floor.
+2. **Magnitude** — for P0-present fish, the within-population depth that separates
+   large-P0 TP from small-P0 wobble.
+
+Wobble = **present but small**.
+
+```{r load}
+data_dir <- file.path(root, params$data_dir)
+
+sweep   <- fread(file.path(data_dir, "measurement_data_per_sweep.csv"))
+windows <- fread(file.path(data_dir, "p0_windows.csv"))
+# Per-sweep windows enable consistency scoring; optional (older exports lack it).
+sw_win_path <- file.path(data_dir, "p0_windows_per_sweep.csv")
+sweep_windows <- if (file.exists(sw_win_path)) fread(sw_win_path) else NULL
+
+fish <- fread(file.path(root, params$fish_data))
+meta <- fish %>%
+  transmute(sample_name = PN, POP, Species, manual_Phenotype = Phenotype) %>%
+  distinct(sample_name, .keep_all = TRUE) %>%
+  mutate(manual_Phenotype = case_when(
+    manual_Phenotype %in% c("Mixed", "mix", "MIXED") ~ "Wobble",
+    TRUE ~ manual_Phenotype)) %>%
+  # Restrict to P. kingsleyae and the three focal phenotypes.
+  filter(Species == params$species,
+         manual_Phenotype %in% c("TP", "Wobble", "BP")) %>%
+  mutate(manual_Phenotype = factor(manual_Phenotype, levels = c("TP", "Wobble", "BP")))
+
+sweep <- sweep %>% inner_join(meta, by = "sample_name")
+pheno_cols <- c("TP" = "#1b9e77", "Wobble" = "#7570b3", "BP" = "#d95f02")
+
+sprintf("%d %s fish (%s)", n_distinct(sweep$sample_name), params$species,
+        paste(names(table(meta$manual_Phenotype)),
+              table(meta$manual_Phenotype), collapse = ", "))
+```
+
+# 1. Population confound: absolute P0 size varies by population
+
+BP-only P0 prominence (no true third phase) differs several-fold across
+populations — so any *absolute* P0 cutoff mislabels fish. This is why we work
+within-population and on shape, not size.
+
+```{r pop-confound}
+per_fish0 <- sweep %>%
+  group_by(sample_name, POP, manual_Phenotype) %>%
+  summarise(prominence_mean = mean(p0_prominence, na.rm = TRUE),
+            vP0_mean = mean(vP0, na.rm = TRUE),
+            aP0_mean = mean(aP0, na.rm = TRUE),
+            n_sweeps = n(), .groups = "drop")
+
+per_fish0 %>% filter(manual_Phenotype == "BP") %>%
+  group_by(POP) %>%
+  summarise(n = n(), BP_prominence_median = median(prominence_mean)) %>%
+  filter(n >= 4) %>% arrange(desc(BP_prominence_median)) %>%
+  knitr::kable(digits = 5, caption = "Baseline (BP) P0 prominence varies by population")
+```
+
+# 2. Amplitude-invariant P0 shape-presence score
+
+A real P0 is a localized dip just before the P1 upswing. We match each fish's
+(z-scored) P0 window against a **bank** of small-dip templates spanning the range of
+real P0 positions and widths, and take the best fit. Using a bank (rather than one
+fixed template) is essential: a single narrow template scored obvious wobbles like
+APA_193 — whose dip sits right at the window edge — as noise. Correlation is
+invariant to P0 *amplitude*, so population size differences drop out.
+
+```{r shape-score-fns}
+# The P0 shape detectors (make_bank / score_matrix / snr_matrix) are shared with
+# the label-free detection layer (p0_statistical_detection.Rmd) and live in a
+# sourced helper so both use the IDENTICAL detector. A bank of small-dip templates
+# spans real P0 positions (right up against the P1 onset, ~0.80-0.94 of the window)
+# and widths; a single fixed template misses edge-positioned wobbles like APA_193.
+# Correlation is amplitude-invariant, so the population size confound cannot leak in.
+source(file.path(root, "code", "02_Phenotyping", "p0_shape_functions.R"))
+```
+
+```{r shape-score-compute}
+# Two complementary presence signals on the averaged window: shape (template bank)
+# and dipSNR (depth vs baseline noise).
+Mavg <- windows %>% column_to_rownames("sample_name") %>% as.matrix()
+Mavg <- Mavg[complete.cases(Mavg), , drop = FALSE]
+avg_scores <- tibble(sample_name = rownames(Mavg),
+                     shape_avg = score_matrix(Mavg),
+                     snr_avg   = snr_matrix(Mavg))
+
+# Per-sweep (if available) -> per-fish medians + consistency. "Present on a sweep" =
+# right shape OR a deep dip; consistency = fraction of the fish's sweeps present.
+if (!is.null(sweep_windows)) {
+  swm <- sweep_windows %>% select(-sample_name, -sweep_index) %>% as.matrix()
+  sweep_windows$shape_sweep <- score_matrix(swm)
+  sweep_windows$snr_sweep   <- snr_matrix(swm)
+  per_sweep_shape <- sweep_windows %>%
+    group_by(sample_name) %>%
+    summarise(shape_med = median(shape_sweep, na.rm = TRUE),
+              snr_med   = median(snr_sweep, na.rm = TRUE),
+              shape_consistency = mean(shape_sweep > 0.5 | snr_sweep > 6, na.rm = TRUE),
+              .groups = "drop")
+} else {
+  per_sweep_shape <- avg_scores %>%
+    transmute(sample_name, shape_med = shape_avg, snr_med = snr_avg,
+              shape_consistency = NA_real_)
+}
+
+per_fish <- per_fish0 %>%
+  left_join(avg_scores, by = "sample_name") %>%
+  left_join(per_sweep_shape, by = "sample_name") %>%
+  # Measure the presence signals on the AVERAGED window (noise averages out, the real
+  # dip survives); per-sweep windows are used only for the consistency check below.
+  mutate(shape_score = coalesce(shape_avg, shape_med),
+         snr_score   = coalesce(snr_avg, snr_med))
+
+per_fish %>% group_by(manual_Phenotype) %>%
+  summarise(n = n(), shape_median = median(shape_score, na.rm = TRUE),
+            dipSNR_median = median(snr_score, na.rm = TRUE)) %>%
+  knitr::kable(digits = 2, caption = "P0 presence signals by manual label")
+
+ggplot(per_fish, aes(shape_score, pmin(snr_score, 30), color = manual_Phenotype)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values = pheno_cols) +
+  labs(x = "Shape score (template bank)", y = "dipSNR (depth vs baseline, capped at 30)",
+       color = "Manual label",
+       title = "Two presence signals: a wobble is high on at least one") +
+  theme_minimal()
+```
+
+# 3. Presence of a distinct P0 — the wobble vs BP call
+
+A wobble carries a distinct P0 that is either the right **shape** (clean localized
+dip) or **deep** relative to baseline noise (visible even against a jittery
+baseline). Both signals are amplitude-invariant / self-normalizing, so the
+population size confound cannot leak in. A fish is **P0-present** if it clears
+*either* threshold; each is set Youden-optimally from confident BP vs wobble.
+
+```{r presence}
+youden_thr <- function(score) {
+  cal <- per_fish %>% filter(manual_Phenotype %in% c("BP", "Wobble"),
+                             is.finite(.data[[score]]))
+  lab <- as.integer(cal$manual_Phenotype == "Wobble")
+  x <- cal[[score]]
+  thrs <- quantile(x, seq(0.05, 0.95, 0.02), na.rm = TRUE)
+  thrs[which.max(sapply(thrs, function(t) {
+    p <- x > t; mean(p[lab == 1]) + mean(!p[lab == 0]) - 1
+  }))]
+}
+shape_thr <- youden_thr("shape_score")
+snr_thr   <- youden_thr("snr_score")
+per_fish <- per_fish %>% mutate(p0_present = shape_score > shape_thr | snr_score > snr_thr)
+sprintf("Presence thresholds — shape > %.2f OR dipSNR > %.1f", shape_thr, snr_thr)
+```
+
+# 4. Magnitude (within-population) — the TP vs wobble call
+
+TP carries a *large* P0; wobble a *small* one. Magnitude is population-confounded,
+so we standardize dip depth against each population's own BP baseline (`depth_z`).
+The TP and wobble depth distributions barely overlap, so a Youden cut between them
+separates cleanly. A large-magnitude fish is TP regardless of the presence signals,
+so magnitude is checked **first**; a fish that is not TP-magnitude but carries a
+distinct P0 is a wobble; the rest are BP.
+
+```{r magnitude}
+per_fish <- per_fish %>% mutate(depth = abs(vP0_mean))
+
+dnull <- per_fish %>% filter(manual_Phenotype == "BP") %>%
+  group_by(POP) %>% summarise(d_med = median(depth, na.rm = TRUE),
+                              d_mad = mad(depth, na.rm = TRUE), .groups = "drop")
+pooled_dmed <- median(per_fish$depth[per_fish$manual_Phenotype == "BP"], na.rm = TRUE)
+pooled_dmad <- mad(per_fish$depth[per_fish$manual_Phenotype == "BP"], na.rm = TRUE)
+
+per_fish <- per_fish %>% left_join(dnull, by = "POP") %>%
+  mutate(d_med = ifelse(is.na(d_med), pooled_dmed, d_med),
+         d_mad = ifelse(is.na(d_mad) | d_mad == 0, pooled_dmad, d_mad),
+         depth_z = (depth - d_med) / d_mad)
+
+# TP cut: Youden-optimal split of TP (large P0) vs wobble (small P0) on depth_z. The
+# two distributions barely overlap, so this cleanly separates them; setting the cut
+# inside the TP distribution (e.g. its lower quartile) would misclassify low-magnitude
+# TP fish (like APA_6685) as wobble.
+tw <- per_fish %>% filter(manual_Phenotype %in% c("TP", "Wobble"), is.finite(depth_z))
+tw_lab <- as.integer(tw$manual_Phenotype == "TP")
+tw_thrs <- quantile(tw$depth_z, seq(0.02, 0.98, 0.01), na.rm = TRUE)
+tp_cut <- tw_thrs[which.max(sapply(tw_thrs, function(x) {
+  p <- tw$depth_z > x; mean(p[tw_lab == 1]) + mean(!p[tw_lab == 0]) - 1
+}))]
+
+per_fish <- per_fish %>%
+  mutate(quant_call = case_when(
+    depth_z >= tp_cut       ~ "TP",       # large P0
+    p0_present              ~ "Wobble",   # distinct but small P0
+    TRUE                    ~ "BP"),      # no distinct P0
+    quant_call = factor(quant_call, levels = c("TP", "Wobble", "BP")))
+
+ggplot(per_fish, aes(shape_score, depth_z, color = manual_Phenotype)) +
+  geom_point(alpha = 0.85) +
+  geom_vline(xintercept = shape_thr, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = tp_cut, linetype = "dotted", color = "grey50") +
+  scale_color_manual(values = pheno_cols) +
+  labs(x = "Presence: P0 shape score (dashed = wobble/BP cut)",
+       y = "Magnitude: depth-z vs population BP (dotted = TP cut)",
+       color = "Manual label", title = "Two P0 axes: shape (x) and magnitude (y)") +
+  theme_minimal()
+
+table(quant = per_fish$quant_call, manual = per_fish$manual_Phenotype) %>%
+  knitr::kable(caption = "Quantitative call vs manual label")
+```
+
+# 5. Per-individual confidence & near-noise flags
+
+Confidence reflects **distance from the population noise floor** and (when
+per-sweep windows exist) **cross-sweep consistency**. Fish sitting near the
+presence threshold — like faint wobbles at the noise floor — are correctly
+flagged low-confidence rather than forced into a bin.
+
+Shape and consistency agree (they carry the same information), so we fold them
+into a single **presence-evidence** score in [0,1]. A call is confident when the
+evidence sits at an extreme (clearly present, or clearly at the noise floor) and
+uncertain only near the middle or when the two signals conflict — so a confidently
+BP fish (low evidence, low consistency) is *not* flagged, only genuinely borderline
+fish are.
+
+```{r confidence}
+# Map each presence signal to [0,1] with data anchors (BP median -> 0, TP median -> 1),
+# then take the stronger of the two (a wobble need only be high on one).
+rescale01 <- function(x, lab) {
+  lo <- median(x[lab == "BP"], na.rm = TRUE); hi <- median(x[lab == "TP"], na.rm = TRUE)
+  pmin(pmax((x - lo) / (hi - lo), 0), 1)
+}
+per_fish <- per_fish %>%
+  mutate(
+    shape01 = rescale01(shape_score, manual_Phenotype),
+    snr01   = rescale01(snr_score, manual_Phenotype),
+    present_strength = pmax(shape01, snr01),
+    presence_evidence = ifelse(is.na(shape_consistency), present_strength,
+                               0.5 * present_strength + 0.5 * shape_consistency),
+    # Averaged window says present but replicates disagree (or vice versa) = uncertain.
+    signal_conflict = !is.na(shape_consistency) &
+                      (p0_present != (shape_consistency > 0.5)),
+    near_noise = presence_evidence < 0.2,    # P0, if any, is at the noise floor
+    # TP confidence is a magnitude margin; wobble/BP confidence is distance of the
+    # presence evidence from the undecided middle (0.5).
+    confidence = ifelse(quant_call == "TP",
+                        pmin(1, abs(depth_z - tp_cut) / max(abs(tp_cut), 1)),
+                        2 * abs(presence_evidence - 0.5)),
+    ambiguous = signal_conflict | confidence < 0.3,
+    disagrees_with_manual = as.character(quant_call) != as.character(manual_Phenotype))
+
+ggplot(per_fish, aes(presence_evidence, confidence, color = manual_Phenotype, shape = ambiguous)) +
+  geom_point(alpha = 0.85, size = 2) +
+  geom_vline(xintercept = c(0.35, 0.65), linetype = "dashed", color = "grey60") +
+  scale_color_manual(values = pheno_cols) +
+  labs(x = "P0 presence evidence (shape + replicate consistency)", y = "Confidence",
+       color = "Manual label", shape = "Ambiguous",
+       title = "Confident at the extremes; uncertain only in the middle") +
+  theme_minimal()
+```
+
+## Priority review list — quantitative call disagrees with manual label
+
+```{r disagreements}
+per_fish %>% filter(disagrees_with_manual) %>%
+  arrange(desc(ambiguous), confidence) %>%
+  select(sample_name, POP, manual_Phenotype, quant_call,
+         shape_score, depth_z, shape_consistency, confidence) %>%
+  knitr::kable(digits = 2, caption = "Fish whose quantitative call differs from the by-eye label")
+```
+
+# Output: per-fish table
+
+```{r write-table}
+out_tbl <- per_fish %>%
+  transmute(sample_name, POP, manual_Phenotype,
+            shape_score, snr_score, shape_consistency, presence_evidence, p0_present,
+            depth_z, quant_call, confidence, ambiguous, near_noise,
+            disagrees_with_manual,
+            prominence_mean, vP0_mean, aP0_mean, n_sweeps) %>%
+  arrange(POP, sample_name)
+
+fwrite(out_tbl, file.path(root, params$data_dir, "p0_confidence_table.csv"))
+sprintf("Wrote %d fish to p0_confidence_table.csv", nrow(out_tbl))
+```
+
+# Interpretation notes
+
+- **Presence (x-axis)** answers "is a distinct P0 there?" against each
+  population's own BP noise floor — the population size confound cannot leak in.
+- **Magnitude (y-axis)** answers "how big?" and only distinguishes TP from wobble.
+  A wobble is high-presence, low-magnitude.
+- **Near-noise wobbles** (e.g. BAM_6550) land just above the presence threshold
+  with low confidence — that is the honest answer for a P0 at the noise floor, and
+  the per-sweep consistency column is what raises or lowers confidence there.
+- `ambiguous`/`disagrees_with_manual` fish are the priority to re-examine against
+  their PDFs in `output_data/02_Phenotyping/<POP>/`.
+```

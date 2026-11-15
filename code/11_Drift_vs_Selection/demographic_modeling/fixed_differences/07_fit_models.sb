@@ -1,0 +1,18 @@
+#!/bin/bash --login
+#SBATCH --time=04:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=6G
+#SBATCH --job-name=fd_fit
+#SBATCH -o output_data/slurm_logs/11_Drift_vs_Selection/demographic_modeling/fit_%A_%a.log
+## 07_fit_models.sb: one line of a task table per array task. Each line holds the arguments to
+## 07_fit_models.py, e.g. "--pair A1w --model M3 --starts 5 --seed 2".
+##   sbatch --export=root=$(pwd),FD_OUT=${FD_OUT},TASKS=<table> --array=1-N%100 .../07_fit_models.sb
+set -euo pipefail
+cd "${root}"
+source "${root}/config.env"
+export OMP_NUM_THREADS=1
+args=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${TASKS}")
+echo "07_fit_models.py ${args}"
+singularity exec --bind "${scratch_dir}" "${dadi_image}" \
+  python3 code/11_Drift_vs_Selection/demographic_modeling/fixed_differences/07_fit_models.py ${args}

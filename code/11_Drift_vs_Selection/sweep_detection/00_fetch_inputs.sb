@@ -1,0 +1,63 @@
+#!/bin/bash --login
+#SBATCH --time=00:10:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=1G
+#SBATCH --job-name=sweep_inputs
+
+## 00_fetch_inputs.sb
+## Check that the inputs of the sweep analysis (and of simulation/00_extract_index_genotypes.sh)
+## are in place, and stage the all-sites VCF on scratch. Nothing is downloaded: every input is
+## either produced by an earlier module of this repository or documented in the root README.
+##
+## Usage (from the repo root, after `source config.env`):
+##   bash code/11_Drift_vs_Selection/sweep_detection/00_fetch_inputs.sb
+## or as a job:
+##   sbatch --export=root=$(pwd) code/11_Drift_vs_Selection/sweep_detection/00_fetch_inputs.sb
+##
+## The all-sites VCF is linked to ${sweep_scratch}/03_QC/, where simulation/00_extract_index_genotypes.sh
+## reads it. Exits non-zero if anything is missing.
+
+root="${root:-$(git rev-parse --show-toplevel)}"
+source "${root}/config.env"
+
+# local path | where it comes from
+items=(
+  "${rehh_image}|built from images/ (see images/README.md)"
+  "${sweepfinder2_image}|built from images/ (see images/README.md)"
+  "${gwas_tools_image}|built from images/ (see images/README.md)"
+  "${dadi_image}|built from images/ (see images/README.md)"
+  "${root}/input_data/00_Reference_Genome/${reference}|reference genome, see the root README (renamed by code/03_VCF_QC_Filter/00_rename_reference.sh)"
+  "${root}/input_data/00_Reference_Genome/${reference}.fai|samtools faidx of the renamed reference"
+  "${root}/output_data/07_Phasing/${phased_vcf}|code/07_Phasing (SHAPEIT4 phasing)"
+  "${root}/output_data/03_QC/${allsites_vcf}|code/03_VCF_QC_Filter (filtered biallelic SNPs + invariant sites)"
+  "${root}/output_data/03_QC/${allsites_vcf}.tbi|code/03_VCF_QC_Filter"
+  "${root}/output_data/05_PopGen/${popgen_prefix}_pi.txt|code/05_PopGen pixy run (read by pixy_lineages/validate_pixy.R)"
+)
+
+missing=0
+for item in "${items[@]}"; do
+  path="${item%%|*}"
+  source_note="${item##*|}"
+  if [[ -s "${path}" ]]; then
+    echo "OK       ${path}"
+  else
+    echo "MISSING  ${path}  <- ${source_note}"
+    missing=$((missing + 1))
+  fi
+done
+
+# stage the all-sites VCF on scratch (symlink, not a copy)
+mkdir -p "${sweep_scratch}/03_QC"
+for f in "${allsites_vcf}" "${allsites_vcf}.tbi"; do
+  if [[ -s "${root}/output_data/03_QC/${f}" && ! -e "${sweep_scratch}/03_QC/${f}" ]]; then
+    ln -s "${root}/output_data/03_QC/${f}" "${sweep_scratch}/03_QC/${f}"
+    echo "LINKED   ${sweep_scratch}/03_QC/${f}"
+  fi
+done
+
+if [[ ${missing} -gt 0 ]]; then
+  echo "${missing} input(s) missing; produce them with the step named above." >&2
+  exit 1
+fi
+echo "All inputs present."

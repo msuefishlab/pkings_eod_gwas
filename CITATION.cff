@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper and this repository."
+title: "The genomic basis of electric signal diversity: analysis code"
+type: software
+license: MIT
+repository-code: "https://github.com/msuefishlab/pkings_eod_gwas"
+authors:
+  - family-names: Gallant
+    given-names: Jason R.
+    affiliation: Michigan State University
+  - family-names: Picq
+    given-names: Sophie
+  - family-names: Koenig
+    given-names: Lauren
+  - family-names: Ngoua Aba'a
+    given-names: Nestor
+  - family-names: Nzigou
+    given-names: Franck
+  - family-names: Mipounga
+    given-names: Hans Kevin
+preferred-citation:
+  type: article
+  title: "The Genomic Basis of Electric Signal Diversity"
+  journal: "Nature Communications"
+  year: 2026
+  authors:
+    - family-names: Gallant
+      given-names: Jason R.
+    - family-names: Picq
+      given-names: Sophie
+    - family-names: Koenig
+      given-names: Lauren
+    - family-names: Ngoua Aba'a
+      given-names: Nestor
+    - family-names: Nzigou
+      given-names: Franck
+    - family-names: Mipounga
+      given-names: Hans Kevin

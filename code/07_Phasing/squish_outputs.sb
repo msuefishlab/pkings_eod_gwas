@@ -1,0 +1,33 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH --time=04:00:00             # limit of wall clock time - how long the job will run (same as -t)
+#SBATCH --ntasks=1                  # number of tasks - how many tasks (nodes) that you require (same as -n)
+#SBATCH --cpus-per-task=4           # number of CPUs (or cores) per task (same as -c)
+#SBATCH --mem=24G                    # memory required per node - amount of memory (in bytes)
+#SBATCH -J squish_outputs
+#SBATCH -o squish_%J_%A_%a.out
+
+########## Command Lines to Run ##########
+
+source $root/config.env
+
+TMPOUTDIR=${scratch_dir}/output_data/07_Phasing/phase_chunks/$1
+
+INTERVAL_FILE=${root}/input_data/01_Terra/remaining_intervals.list
+INTERVAL_COUNT=$(sed -n \$= $INTERVAL_FILE)
+SN=$1
+
+rm -f $TMPOUTDIR/final_chunk.list
+touch $TMPOUTDIR/final_chunk.list
+while read INTERVAL
+	do
+	ls -1 $TMPOUTDIR/*${INTERVAL}.whatshap.vcf.gz >> $TMPOUTDIR/final_chunk.list
+done < $INTERVAL_FILE
+
+singularity exec ${gatk_image} /gatk/gatk MergeVcfs I=$TMPOUTDIR/final_chunk.list O=$TMPOUTDIR/${SN}_final_chunk.whatshap.vcf.gz D=${root}/input_data/00_Reference_Genome/jordan-mic4273-mb-hirise-20xx3__06-13-2024__final_assembly.dict 
+singularity exec ${gwas_tools_image} bcftools index $TMPOUTDIR/${SN}_final_chunk.whatshap.vcf.gz
+
+cat $TMPOUTDIR/final_chunk.list | xargs rm
+cat $TMPOUTDIR/final_chunk.list | sed s/$/".csi"/ | xargs rm

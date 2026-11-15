@@ -1,0 +1,54 @@
+#!/bin/bash --login
+#SBATCH --time=04:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --job-name=sf2_convert
+#SBATCH --array=0-4
+
+## 10_sf2_convert.sb
+## Convert each lineage's polarized per-chromosome VCFs to SweepFinder2 input, all 25
+## chromosomes, one array task per lineage.
+##
+## Two choices (DESIGN.md section 4):
+##   - all 25 chromosomes, so the background spectrum and the null regions come from the whole
+##     genome;
+##   - polymorphic sites only. Keeping sites that are monomorphic in the sample makes the CLR
+##     partly a SNP-density statistic, and the peaks were ascertained in SNP-dense regions.
+##
+## MODE=folded additionally writes a folded-spectrum copy, the polarization sensitivity check.
+##
+## Usage (from the repo root):
+##   sbatch --export=root=$(pwd) -o output_data/slurm_logs/11_Drift_vs_Selection/sweep_detection/sf2_convert_%A_%a.log \
+##     code/11_Drift_vs_Selection/sweep_detection/sweepfinder2/10_sf2_convert.sb
+##   sbatch --export=root=$(pwd),MODE=folded ...   # the folded check
+
+set -euo pipefail
+source "${root}/config.env"
+
+mode="${MODE:-unfolded}"
+lineages=(BP1 TP1 BP2 TP2 BP3)
+pop="${lineages[${SLURM_ARRAY_TASK_ID}]}"
+
+vcfdir="${root}/output_data/11_Drift_vs_Selection/sweep_detection/by_chrom"
+outdir="${root}/output_data/11_Drift_vs_Selection/sweep_detection/sweepfinder2/sfs_input_${mode}"
+mkdir -p "${outdir}"
+
+flags=(--polymorphic-only)
+[[ "${mode}" == "folded" ]] && flags+=(--folded)
+
+echo "Population ${pop}, mode ${mode}, flags: ${flags[*]}"
+for i in $(seq 1 25); do
+  chrom="chr${i}"
+  vcf="${vcfdir}/${pop}.polarized.${chrom}.vcf.gz"
+  out="${outdir}/${pop}.${chrom}.sf2.txt"
+  if [[ ! -f "${vcf}" ]]; then echo "  ${chrom}: MISSING ${vcf}"; exit 1; fi
+  if [[ -s "${out}" ]]; then echo "  ${chrom}: already done"; continue; fi
+  echo "--- ${chrom}"
+  singularity exec --bind "${scratch_dir}" "${gwas_tools_image}" \
+    python3 "${root}/code/11_Drift_vs_Selection/sweep_detection/sweepfinder2/vcf_to_sweepfinder2.py" \
+    "${vcf}" "${out}" -c "${chrom}" "${flags[@]}"
+done
+
+echo "Finished ${pop}: $(date)"
+wc -l "${outdir}/${pop}".chr*.sf2.txt | tail -1

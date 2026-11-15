@@ -1,0 +1,50 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH --time=04:00:00             # limit of wall clock time - how long the job will run (same as -t)
+#SBATCH --ntasks=1                  # number of tasks - how many tasks (nodes) that you require (same as -n)
+#SBATCH --cpus-per-task=2           # number of CPUs (or cores) per task (same as -c)
+#SBATCH --mem=12g                    # memory required per node - amount of memory (in bytes)
+#SBATCH -J relmatrix
+#SBATCH -A data-machine
+########## Command Lines to Run ##########
+cd $root
+
+source $root/config.env
+
+MYNAME=$(whoami)
+
+indir=${root}/output_data/06_Association/
+outdir=${root}/output_data/06_Association/
+tmpoutdir=${TMPDIR:-/tmp}/${SLURM_JOB_ID}
+
+mkdir -p ${outdir}
+mkdir -p ${tmpoutdir}
+
+mkdir -p ${outdir}/$OUTNAME
+mkdir -p ${tmpoutdir}/$OUTNAME
+
+
+#prune for rel matrix
+echo singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} bash -c "bcftools +prune -n 1 -w 20000bp --nsites-per-win-mode rand --random-seed 42 -O z -o /tmp_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.vcf.gz /out_dir/$OUTNAME/${OUTNAME}_merge_ID.vcf.gz"
+singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} bash -c "bcftools +prune -n 1 -w 20000bp --nsites-per-win-mode rand --random-seed 42 -O z -o /tmp_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.vcf.gz /out_dir/$OUTNAME/${OUTNAME}_merge_ID.vcf.gz"
+
+echo singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} bash -c "bcftools index /tmp_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.vcf.gz"
+singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} bash -c "bcftools index /tmp_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.vcf.gz"
+
+# get proper order of individuals
+cat ${root}/input_data/06_Association/${OUTNAME}.pheno.txt | cut -f1 | tail -n+2 > ${outdir}/$OUTNAME/$OUTNAME.order
+
+# create phenotype file
+cat ${root}/input_data/06_Association/${OUTNAME}.pheno.txt | cut -f3 | tail -n+2 > ${outdir}/$OUTNAME/$OUTNAME.pheno
+
+# rename missing phenotypes to NA
+sed -i 's/-9/NA/g' ${outdir}/$OUTNAME/$OUTNAME.pheno
+
+echo singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} /qctool/qctool -g /tmp_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.vcf.gz -ofiletype bimbam_dosage -og /out_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.geno -os  /out_dir/$OUTNAME/$OUTNAME.sample -reorder /out_dir/$OUTNAME/$OUTNAME.order
+singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} /qctool/qctool -g /tmp_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.vcf.gz -ofiletype bimbam_dosage -og /out_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.geno -os  /out_dir/$OUTNAME/$OUTNAME.sample -reorder /out_dir/$OUTNAME/$OUTNAME.order
+
+##create relatedness matrix (centered is best reccomendation for starting off in the documentation)
+echo singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} /gemma/GEMMA/bin/gemma -g /out_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.geno  -p /out_dir/$OUTNAME/$OUTNAME.pheno -gk 1 -outdir /out_dir/$OUTNAME/ -o ${OUTNAME}.relate
+singularity exec --bind $root:/project_root --bind $outdir:/out_dir --bind $tmpoutdir:/tmp_dir ${gwas_tools_image} /gemma/GEMMA/bin/gemma -g /out_dir/$OUTNAME/${OUTNAME}.prune.for_gemma.geno  -p /out_dir/$OUTNAME/$OUTNAME.pheno -gk 1 -outdir /out_dir/$OUTNAME/ -o ${OUTNAME}.relate

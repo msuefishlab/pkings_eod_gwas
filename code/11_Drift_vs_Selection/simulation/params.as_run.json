@@ -1,0 +1,89 @@
+{
+ "M0|4e-09": {
+  "N_anc": 151651.0,
+  "N_BP_start": 35513.7,
+  "N_BP_end": 35513.7,
+  "N_TP_start": 97244.8,
+  "N_TP_end": 97244.8,
+  "T_gen": 12759.6,
+  "m_BP_from_TP_pergen": 0.0,
+  "m_TP_from_BP_pergen": 0.0
+ },
+ "M0|1e-08": {
+  "N_anc": 60660.5,
+  "N_BP_start": 14205.5,
+  "N_BP_end": 14205.5,
+  "N_TP_start": 38897.9,
+  "N_TP_end": 38897.9,
+  "T_gen": 5103.85,
+  "m_BP_from_TP_pergen": 0.0,
+  "m_TP_from_BP_pergen": 0.0
+ },
+ "M1|4e-09": {
+  "N_anc": 97087.5,
+  "N_BP_start": 44334.0,
+  "N_BP_end": 44334.0,
+  "N_TP_start": 107816.0,
+  "N_TP_end": 107816.0,
+  "T_gen": 708467.0,
+  "m_BP_from_TP_pergen": 1.18424e-05,
+  "m_TP_from_BP_pergen": 1.18424e-05
+ },
+ "M1|1e-08": {
+  "N_anc": 38835.0,
+  "N_BP_start": 17733.6,
+  "N_BP_end": 17733.6,
+  "N_TP_start": 43126.2,
+  "N_TP_end": 43126.2,
+  "T_gen": 283387.0,
+  "m_BP_from_TP_pergen": 2.9606e-05,
+  "m_TP_from_BP_pergen": 2.9606e-05
+ },
+ "M2|4e-09": {
+  "N_anc": 147660.0,
+  "N_BP_start": 50188.3,
+  "N_BP_end": 50188.3,
+  "N_TP_start": 100569.0,
+  "N_TP_end": 100569.0,
+  "T_gen": 174532.0,
+  "m_BP_from_TP_pergen": 8.68242e-06,
+  "m_TP_from_BP_pergen": 1.47711e-05
+ },
+ "M2|1e-08": {
+  "N_anc": 59064.2,
+  "N_BP_start": 20075.3,
+  "N_BP_end": 20075.3,
+  "N_TP_start": 40227.4,
+  "N_TP_end": 40227.4,
+  "T_gen": 69812.7,
+  "m_BP_from_TP_pergen": 2.17061e-05,
+  "m_TP_from_BP_pergen": 3.69276e-05
+ },
+ "M3|4e-09": {
+  "N_anc": 218574.0,
+  "N_BP_start": 64044.3,
+  "N_BP_end": 50241.4,
+  "N_TP_start": 154530.0,
+  "N_TP_end": 98548.4,
+  "T_gen": 854012.0,
+  "m_BP_from_TP_pergen": 8.58337e-06,
+  "m_TP_from_BP_pergen": 1.4919e-05
+ },
+ "M3|1e-08": {
+  "N_anc": 87429.6,
+  "N_BP_start": 25617.7,
+  "N_BP_end": 20096.6,
+  "N_TP_start": 61811.8,
+  "N_TP_end": 39419.4,
+  "T_gen": 341605.0,
+  "m_BP_from_TP_pergen": 2.14584e-05,
+  "m_TP_from_BP_pergen": 3.72975e-05
+ },
+ "r_rate": 1e-08,
+ "chunk_len": 2000000,
+ "delta_peak4": 0.8083518577326135,
+ "delta_peak5": 0.7835820895522388,
+ "L_scan": 618475302.0,
+ "L_mask": 532739484.0,
+ "GENOME": 888337685
+}

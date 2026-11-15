@@ -1,0 +1,75 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH --time=8:00:00             # limit of wall clock time - how long the job will run (same as -t)
+#SBATCH --ntasks=1                  # number of tasks - how many tasks (nodes) that you require (same as -n)
+#SBATCH --cpus-per-task=1           # number of CPUs (or cores) per task (same as -c)
+#SBATCH --mem=12G                    # memory required per node - amount of memory (in bytes)
+#SBATCH --job-name SPLIT_VCF_TO_GENES      # you can give your job a name for easier identification (same as -J)
+########## Command Lines to Run ##########
+cd $root
+
+source $root/config.env
+
+MYNAME=$(whoami)
+
+indir=${root}/output_data/03_QC/
+outdir=${root}/output_data/04_Phylogenomics/
+refdir=${root}/input_data/00_Reference_Genome/
+tmpoutdir=${TMPDIR:-/tmp}/${SLURM_JOB_ID}/
+
+mkdir -p ${outdir}
+mkdir -p ${tmpoutdir}
+
+OUTROOT=${invariant_and_snps_vcf%".vcf.gz"}
+
+# Calculate file suffix for this task, ensuring it matches the split file naming
+file_suffix=$(printf "chunk_%03d" "${SLURM_ARRAY_TASK_ID}")
+
+regionfile=${refdir}/split_regions/${file_suffix}
+
+# Initialize the command with bcftools view but without specifying the VCF file yet
+
+# Generate the -r options using awk and append them directly to the bcftools command
+ranges=$(awk '
+    BEGIN {FS="@"} # Use "@" as the field separator for initial split
+    {
+        split($2, pos, /[:-]/); # Split the second part based on "-", ":", to get chr, start, end
+        chr = pos[1]; # Chromosome is the first element
+        start = pos[2]; # Start position is the second element
+        end = pos[3]; # End position is the third element
+
+        if (!min[chr] || start < min[chr]) min[chr] = start;
+        if (!max[chr] || end > max[chr]) max[chr] = end;
+    }
+    END {
+        for (chr in min) {
+            # Subtract 100 from min[chr] and add 100 to max[chr], also ensure that min[chr] does not go below 1
+            printf("-r %s:%d-%d ", chr, (min[chr] > 100 ? min[chr] - 100 : 1), max[chr] + 100);
+        }
+    }
+' "$regionfile")
+
+
+
+
+echo singularity exec --bind $indir:/in_dir --bind ${tmpoutdir}:/out_dir ${gwas_tools_image} bcftools view $ranges /in_dir/${invariant_and_snps_vcf} -Oz -o /out_dir/${invariant_and_snps_vcf}.${SLURM_ARRAY_TASK_ID}.vcf.gz
+singularity exec --bind $indir:/in_dir --bind ${tmpoutdir}:/out_dir ${gwas_tools_image} bcftools view $ranges /in_dir/${invariant_and_snps_vcf} -Oz -o /out_dir/${invariant_and_snps_vcf}.${SLURM_ARRAY_TASK_ID}.vcf.gz
+
+echo singularity exec --bind $indir:/in_dir --bind ${tmpoutdir}:/out_dir ${gwas_tools_image} tabix /out_dir/${invariant_and_snps_vcf}.${SLURM_ARRAY_TASK_ID}.vcf.gz
+singularity exec --bind $indir:/in_dir --bind ${tmpoutdir}:/out_dir ${gwas_tools_image} tabix /out_dir/${invariant_and_snps_vcf}.${SLURM_ARRAY_TASK_ID}.vcf.gz
+
+mkdir -p ${outdir}/gene_alignments/
+
+echo "Now running Create Fasta Alignment on ${file_suffix}..."
+
+singularity exec --bind ${tmpoutdir}:/in_dir --bind ${outdir}:/out_dir ${gwas_tools_image} python3 ${root}/code/04_Phylogenomics/create_fasta_alignment.py \
+/in_dir/${invariant_and_snps_vcf}.${SLURM_ARRAY_TASK_ID}.vcf.gz \
+${regionfile} \
+/out_dir/gene_alignments/
+
+singularity exec --bind ${tmpoutdir}:/in_dir --bind ${outdir}:/out_dir ${gwas_tools_image} python3 ${root}/code/04_Phylogenomics/create_fasta_alignment.py \
+/in_dir/${invariant_and_snps_vcf}.${SLURM_ARRAY_TASK_ID}.vcf.gz \
+${regionfile} \
+/out_dir/gene_alignments/

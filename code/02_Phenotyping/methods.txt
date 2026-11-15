@@ -1,0 +1,41 @@
+Quantitative classification of the EOD P0 phase (TP / Wobble / BP)
+=================================================================
+
+EOD waveforms were phenotyped for the presence and magnitude of the small
+head-negative first phase (P0) that distinguishes triphasic (TP), "wobble", and
+biphasic (BP) discharges. All analysis was restricted to Paramormyrops
+kingsleyae. Each fish's replicate sweeps were peak-to-peak normalized and locally
+baselined (median of a flat pre-P1 window) in MATLAB, and per-sweep measurements
+plus an iZC1-anchored P0 window (the ~1 ms preceding the zero-crossing before the
+P1 upswing) were exported (export_per_sweep_measurements.m). Because the absolute
+size of the P0 baseline varies several-fold among populations for reasons
+unrelated to phenotype, the classifier was designed so that neither axis depends
+on absolute P0 size in a population-specific way, and no threshold was fit to the
+by-eye phenotype labels (which were reserved for held-out validation).
+
+P0 phenotype was resolved on two orthogonal, label-free axes. (1) Presence (BP vs
+P0-present) was scored with two amplitude-invariant statistics computed on the
+per-sweep-average P0 window: a shape score (maximum Pearson correlation against a
+bank of small negative-Gaussian dip templates spanning the realistic range of P0
+positions and widths) and dipSNR (dip depth expressed in units of the fish's own
+baseline-noise MAD). A three-component Gaussian mixture model (mclust) was fit to
+(shape, log dipSNR); the lowest-dipSNR component was taken as the no-P0 (BP) mode,
+and presence probability computed as one minus its posterior. (2) Magnitude
+(Wobble vs TP, among P0-present fish) was scored with the peak-to-peak-normalized
+P0 amplitude |vP0| — the depth of the P0 relative to the whole discharge — which,
+unlike dipSNR, is population-robust (~2.7-fold vs ~7-fold spread across TP
+populations); the TP/Wobble boundary was placed at the data-driven antimode of a
+two-component mixture on log|vP0|. Fish near either boundary were labeled Ambiguous
+rather than force-classified, reflecting the continuous nature of the BP-to-TP P0
+gradient. Cross-sweep P0-latency consistency was recorded as an auxiliary flag but
+was not used in the call, because it is confounded by the reproducible waveform
+onset (clean BP discharges are as latency-consistent as weak wobbles).
+
+The classifier was validated against seven fish with independently confirmed
+electrocyte anatomy (four TP, two wobble, one BP), which it classified correctly in
+six of seven cases; the single miss was a wobble whose P0 amplitude lay at the
+recording noise floor and which was flagged as unresolvable rather than misassigned.
+Notably, the quantitative call corrected one anatomically-confirmed wobble that had
+been mislabeled BP by eye. At the weakest-wobble margin the P0 is at or below the
+resolution of the electric signal and cannot be assigned from the EOD alone; such
+fish are flagged for anatomical follow-up.

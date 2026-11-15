@@ -1,0 +1,30 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH --time=00:30:00             # limit of wall clock time - how long the job will run (same as -t)
+#SBATCH --ntasks=1                  # number of tasks - how many tasks (nodes) that you require (same as -n)
+#SBATCH --cpus-per-task=1           # number of CPUs (or cores) per task (same as -c)
+#SBATCH --mem=4g                    # memory required per node - amount of memory (in bytes)
+#SBATCH -J DSUITE
+#SBATCH -A data-machine
+
+########## Command Lines to Run ##########
+
+## Dsuite Dtrios on one peak window. Called by 03_submit_dsuite_peaks.sh with chr, start, end, peak, vcf and root.
+
+cd $root
+
+source $root/config.env
+
+outdir=${root}/output_data/10_Introgression/peaks_extended/
+indir=${root}/input_data/10_Introgression/
+scratchdir=${scratch_dir}/dsuite/vcfs/
+
+mkdir -p ${scratchdir}
+
+module load BCFtools
+
+bcftools view -r chr${chr}:${start}-${end} ${vcf} -Oz -o ${scratchdir}/peak_${peak}.vcf.gz
+
+singularity exec ${root}/images/dsuite_tools.sif /opt/Dsuite/Build/Dsuite Dtrios -o ${outdir}/peak_${peak} -t ${indir}/pops.tree ${scratchdir}/peak_${peak}.vcf.gz ${indir}/SETS.txt

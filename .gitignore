@@ -1,0 +1,43 @@
+# Generated outputs and large intermediates
+output_data/
+scratch/
+slurm-*.out
+
+# Container images (build from images/; see images/README.md)
+images/*.sif
+
+# Downloaded or generated inputs (see README: "Data")
+input_data/00_Reference_Genome/*
+!input_data/00_Reference_Genome/README.md
+!input_data/00_Reference_Genome/*.chrnames
+!input_data/00_Reference_Genome/refseq_accession_to_chr.csv
+input_data/04_Phylogenomics/mormyrid_specimens_with_phenotypes.csv
+input_data/01_Terra/data_model/SupplementalDataS1_Fish_Specimens.xlsx
+input_data/01_Terra/data_model/fish_data_2023.txt
+input_data/01_Terra/data_model/fish_data_2024a.txt
+input_data/02_Phenotyping/eods/
+input_data/01_Terra/data_model/SupplementalData*
+input_data/04_Phylogenomics/SupplementalData*
+input_data/16_IHC/
+
+# Sequence, alignment and genotype files never belong in git
+*.bam
+*.bai
+*.cram
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.bcf
+*.fastq
+*.fastq.gz
+*.fq.gz
+
+# Tooling and OS
+.claude/
+.DS_Store
+.Rhistory
+.Rproj.user/
+__pycache__/
+*.pyc
+*_files/
+*.nb.html

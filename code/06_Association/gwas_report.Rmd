@@ -1,0 +1,249 @@
+---
+title: "GWAS Report"
+output: html_notebook
+params:
+  data_path: PKINGS_ALL_WOB_EXCLUDED
+  output_file: NULL
+  MAF_thresh: 0.15
+  test: lrt
+---
+
+```{r setup, include=FALSE}
+root<-rprojroot::find_root(".git/index")
+knitr::opts_knit$set(root.dir = root)
+require(yaml)
+require(tidyverse)
+require(stringr)
+require(GenomicRanges)
+require(rtracklayer)
+require(data.table)
+source(file.path(root,"code","06_Association","gemma_gwas_functions.R"))
+```
+
+# Load Data
+```{r}
+# test = "wald" reads GEMMA -lmm 1 output (p_wald); test = "lrt" reads -lmm 2 output (p_lrt)
+gemma_suffix<-c(wald=".lmm1.assoc.txt", lrt=".lmm2.assoc.txt")[[params$test]]
+p_col<-c(wald="p_wald", lrt="p_lrt")[[params$test]]
+gemma_file<-file.path(root,"output_data","06_Association",params$data_path,paste0(params$data_path,gemma_suffix))
+minpath<-file.path(root,"output_data","06_Association",params$data_path,paste0(params$data_path,"_permution"),"min.txt")
+```
+
+# Determine Thresholds for Significant and Suggestive SNPs
+```{r}
+pk.lmm<- gemma.order(gemma_file, p_col)
+min_data<-read.csv(minpath,header=F,sep="\t")
+# min.txt holds the min-p row of each permutation without a header: p_wald is column 12, p_lrt column 10
+pvals<-sort(min_data[[c(wald="V12", lrt="V10")[[params$test]]]], decreasing = F)
+significant = -log10(pvals[length(pvals) - floor(length(pvals)*0.95)])
+suggestive = -log10(pvals[length(pvals) - floor(length(pvals)*0.67)])
+#significant=7
+#suggestive=6
+print(paste0("The threshold for signficant association is: ",significant))
+print(paste0("The threshold for suggestive association is: ",suggestive))
+```
+# Define Peaks
+```{r}
+#remove low log p to reduce memory footprint
+pk.lmm.filt <- pk.lmm %>% filter(log_p > 1) %>% filter(af > params$MAF_thresh) %>% filter((!grepl("ups", chr)) & !is.na(row) & !is.na(log_p)) %>% arrange(numeric_chr)
+
+#define peaks using an arbitrarily low threshold, merging windows within 75kb and removing singleton SNP peaks
+pk.lmm.peaks <- peak_list_permutation(pk.lmm.filt, "log_p",3, 4) 
+
+#define intervals where the peaks are, keeping information on length and mean/max p values
+pk.lmm.bed <- gemma.peak.bed(pk.lmm.peaks,suggestive)
+
+```
+
+```{r}
+pk.lmm.filt %>% 
+  ggplot(aes(x = af)) +
+  geom_density(fill="lightblue",aes(y=..scaled..))
+```
+
+# Refine Peaks
+```{r}
+#create a filtered bed file that has peaks only with snps above the threshold
+
+pk.lmm.bed.f <- pk.lmm.bed %>% 
+  filter(max.log_p > suggestive ) %>% 
+  filter(num.snps.above.threshold > 5) %>% 
+  ungroup() %>% 
+  arrange(numeric_chr, start) %>% #arrange by chr order
+  mutate(peak.original = peak, #new col for original peak name
+       peak.new = row_number(), #new names for peaks using row_number()
+       peak = peak.new) #reset original peak column to the renumbered version
+
+# Plot how many snps are in each peak
+ggplot(pk.lmm.bed.f,aes(x=num.snps)) + geom_histogram(bins=10) + scale_x_log10()
+```
+
+```{r}
+peak_data_path<-file.path(root,"output_data","06_Association",params$data_path)
+
+if (!dir.exists(peak_data_path)){
+  dir.create(peak_data_path)
+}
+
+peak.name.simple <- pk.lmm.bed.f %>% dplyr::select(peak.new, peak.original)
+
+#create a SNP file that is only the peaks after filtering
+pk.lmm.peaks.out <- pk.lmm.peaks %>% 
+  filter(peak %in% pk.lmm.bed.f$peak.original)
+pk.lmm.peaks.out <- left_join(pk.lmm.peaks.out, peak.name.simple, by = c("peak" = "peak.original")) %>% 
+  dplyr::rename(peak.original = peak, peak= peak.new) %>% arrange(peak)
+write.table(pk.lmm.peaks.out,file.path(peak_data_path,paste0(params$data_path,"_SNPS_IN_PEAKS.txt")), sep = "\t", quote = F, row.names = F, col.names = T)
+
+#create a file that is only the top 250 SNPs per peak
+pk.lmm.peaks.slice <- pk.lmm.peaks.out %>% group_by(peak) %>% 
+  slice_max(log_p, n = 250) %>% 
+  dplyr::select(chr, ps, log_p, peak)
+write.table(pk.lmm.peaks.slice,file.path(peak_data_path,paste0(params$data_path,"_SNPS_IN_PEAKS_TOP250.txt")), sep = "\t", quote = F, row.names = F, col.names = F)
+
+pk.lmm.peaks.slice %>% group_by(peak) %>% 
+  summarise(n = n(),
+            min = min(log_p),
+            max = max(log_p))
+
+# write index SNPS
+index_snps <- pk.lmm.peaks.out %>%
+  group_by(peak) %>%
+  # Filter for rows with the maximum log_p value within each peak
+  filter(log_p == max(log_p)) %>%
+  # Sample one row randomly in case of ties
+  slice_sample(n = 1) %>%
+  ungroup() %>% # Remove the grouping structure
+  mutate(new_rs = str_split(rs, ":", simplify = TRUE)[, 1])
+
+
+write.table(index_snps$new_rs,file.path(peak_data_path,paste0(params$data_path,"_index_snps.txt")), sep = "\t", quote = F, row.names = F, col.names = F)
+
+#output bed file of UNFILTERED peaks
+pk.lmm.bed %>% dplyr::select(numeric_chr,start,end, peak) %>% 
+  write.table(file.path(peak_data_path,paste0(params$data_path,"_PEAKS_unfiltered.bed")), sep = "\t", quote = F, row.names = F, col.names = F)
+
+#output bed file of peaks
+pk.lmm.bed.f %>% dplyr::arrange(max.log_p) %>% dplyr::select(numeric_chr,start,end, peak,max.log_p,most_significant_bp) %>% 
+  write.table(file.path(peak_data_path,paste0(params$data_path,"_PEAKS.bed")), sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+```{r, fig.width=20,fig.height=5}
+dynamic_max <- quantile(pk.lmm.filt$log_p, 0.99999)
+
+
+peak_bounds <- pk.lmm.peaks.out %>%
+  group_by(peak) %>%
+  summarise(
+    xmin = min(row)-10000,
+    xmax = max(row)+10000,
+    ymin = 1,  # Lower limit for the rectangle
+    ymax = dynamic_max # Upper limit (use dynamic_max for finite height in plots)
+  )
+
+
+p.gemma <- manc2.labels(pk.lmm.filt, "log_p")
+man_final<-
+    p.gemma +
+
+  geom_rect(
+    data = peak_bounds,
+    aes(
+      xmin = xmin, xmax = xmax,
+      ymin = ymin, ymax = dynamic_max
+    ),
+    fill = "grey", alpha = 0.3, inherit.aes = FALSE   # Avoid inheriting from base plot  # Adjust color and transparency as needed
+  ) +
+  geom_text(
+    data = peak_bounds,
+    aes(
+      x = (xmin + xmax) / 2,    # Center of the rectangle
+      y = dynamic_max + 1,    # Slightly above the dynamic_max
+      label = peak
+    ),
+    inherit.aes = FALSE,
+    size = 4,                  # Adjust size for readability
+    color = "black"            # Adjust color for visibility
+  ) +
+  geom_hline(yintercept = suggestive, linetype = 2, color = "blue") +
+  geom_hline(yintercept = significant, linetype = 2, color = "red") +
+    geom_point(data = subset(pk.lmm.peaks.out, log_p > suggestive-2), aes(x = row, y = log_p,size=log_p), color = "red", shape=20,stroke=0.2,alpha=0.25) +
+   
+  scale_size_continuous(range = c(0.9, 3)) +
+  labs(y = expression(paste("-log"[10], italic("P"),"-value")),x= "Chromosome")+
+  ylim(c(1,dynamic_max+2))+
+  theme(
+    axis.text = element_text(size = 14),  # Adjust tick label font size
+    axis.title.x = element_text(size = 16),      # x-axis label font size
+    axis.title.y = element_text(size = 16)       # y-axis label font size
+    )
+
+man_final
+```
+```{r, fig.width=24, eval=requireNamespace("circlize", quietly=TRUE)}
+# circos plots need circlize (not in the gwas_tools container); skipped when it is missing
+p.circos <- circos.manhattan(
+    df.in = pk.lmm.filt,           # All filtered data
+    input.var = "log_p",
+    peaks_df = pk.lmm.peaks.out,   # Peak SNPs only
+    sig_threshold = significant,    # Red dashed line
+    sug_threshold = suggestive,     # Blue dashed line
+    grid_lines = TRUE,
+   gap_size = 1,
+   dynamic_max = dynamic_max,
+   highlight_peaks = TRUE,
+   # Color controls
+   chr_colors = c("grey30", "maroon"),
+   peak_color = "pink",
+   peak_alpha = 0.3,
+   peak_point_color = "red",
+   sig_line_color = "red",
+   sug_line_color = "blue",
+   grid_color = "grey40",
+   # Point size controls
+   point_size_range = c(0.8, .8),
+   point_alpha = 0.25,
+   peak_point_alpha = 0.4,
+   # Font size controls
+   peak_label_size = 2,
+   axis_label_size = 1,
+   # Performance controls
+   downsample_low_p = FALSE,
+   plot_radius = 1,          # Large plot ✓
+    data_track_height = 0.3,
+    show_ideogram = FALSE,  # Hide ideogram, show labels on data track
+    chr_label_size = 2,    # You can increase this for better visibility
+  )
+
+  # Display or save
+  print(p.circos)
+```
+```{r, fig.width=48, eval=requireNamespace("circlize", quietly=TRUE)}
+pk.lmm.filt<-droplevels(pk.lmm.filt)
+
+circos.manhattan.zoom(
+    df.in = pk.lmm.filt,
+    input.var = log_p,
+    zoom_peaks = pk.lmm.bed.f,
+    sig_threshold = significant,
+    sug_threshold = suggestive,
+    parent_point_size = 1.5,  # Smaller parent points
+    zoom_point_size = 2,    # Larger zoom points
+    parent_label_size = 2,  # Larger parent labels
+    zoom_label_size = 3,     # Smaller zoom labels
+      connection_height = .05,  # Less space on inner side
+    zoom_xaxis_label_size = 2,    # X-axis bp positions
+    parent_yaxis_label_size = 2,  # Parent y-axis
+    zoom_yaxis_label_size = 2,     # Zoom y-axis
+   zoom_gap_degree = 15,
+   parent_ylim = c(0, 15),
+    zoom_ylim = c(0, 15),
+   chr_colors = c("grey30", "#800020"),
+   parent_gap_degree = 0
+  )
+
+```
+  
+```{r}
+ggsave(file.path(root,"output_data/06_Association",params$data_path,paste0(params$data_path,".gwas.svg")), plot = man_final, width = 12, height = 4, units = "in")
+```

@@ -1,0 +1,26 @@
+#!/bin/bash --login
+
+########## Define Resources Needed with SBATCH Lines ##########
+
+#SBATCH -t 01:00:00
+#SBATCH --ntasks=1                  # number of tasks - how many tasks (nodes) that you require (same as -n)
+#SBATCH --cpus-per-task=2           # number of CPUs (or cores) per task (same as -c)
+#SBATCH --mem=2G                    # memory required per node - amount of memory (in bytes)
+#SBATCH -J copy-from-google
+#SBATCH -o copy_%J_%A_%a.out
+
+########## Command Lines to Run ##########
+
+root="$(git rev-parse --show-toplevel)"
+source ${root}/"config.env"
+
+# gsutil from a Google Cloud SDK container (docker://google/cloud-sdk); adjust the image path for your system
+mamba activate gcloud
+
+readarray -t readfiles < ${root}/input_data/07_Phasing/AR_BAMLIST_2024.txt 
+
+outdir=${scratch_dir}/output_data/07_Phasing/
+mkdir -p ${outdir}
+
+cd ${outdir}
+singularity exec ~/singularity_images/cloud-sdk_latest.sif gsutil -m cp ${readfiles[$SLURM_ARRAY_TASK_ID]} .

@@ -1,0 +1,21 @@
+#!/bin/bash --login
+#SBATCH --account=general
+#SBATCH --partition=general-long
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=24G
+#SBATCH --time=3-00:00:00
+#SBATCH -J smcpp_orchestrate
+#SBATCH -o output_data/slurm_logs/12_Historical_Ne/orchestrate_%j.log
+
+# Controller for the whole smc++ pipeline; it submits and waits on the SLURM arrays.
+# Submit from the repository root, after creating the log directory:
+#   source config.env
+#   mkdir -p output_data/slurm_logs/12_Historical_Ne
+#   sbatch code/12_Historical_Ne/scripts/run_smcpp.sb
+# If it hits its walltime or is cancelled, submit it again: finished tasks are skipped
+# and still-running arrays are adopted rather than resubmitted.
+# Results are exported to ${scratch_dir}/smcpp/v2/export/ (override with OUTD=...).
+
+set -euo pipefail
+cd "$SLURM_SUBMIT_DIR"
+bash code/12_Historical_Ne/scripts/orchestrate.sh

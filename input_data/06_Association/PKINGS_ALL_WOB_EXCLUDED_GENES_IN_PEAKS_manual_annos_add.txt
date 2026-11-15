@@ -1,0 +1,28 @@
+seqnames	start	end	ID	description	gene	manual_name
+chr6	29440622	29454690	gene-LOC111844724	ras-related protein Rab-7b-like	LOC111844724	rab7b
+chr6	29451718	29455207	gene-LOC111844731	CMRF35-like molecule 7	LOC111844731	cd300lb
+chr6	29458599	29481499	gene-frs3	fibroblast growth factor receptor substrate 3	frs3
+chr6	29484602	29498333	gene-LOC111844745	uncharacterized LOC111844745	LOC111844745
+chr6	29533380	29538455	gene-LOC111844692	ETS-related transcription factor Elf-3-like	LOC111844692	elf3
+chr8	15730621	15753279	gene-LOC111839856	protein kinase C delta type-like	LOC111839856	prkcd
+chr8	15756316	15764153	gene-rft1	RFT1 homolog	rft1
+chr8	15766265	15781093	gene-LOC111839880	scm-like with four MBT domains protein 1	LOC111839880	sfmbt1
+chr8	15788268	15801587	gene-LOC111841399	inter-alpha-trypsin inhibitor heavy chain H3-like	LOC111841399	itih3
+chr13	24730563	24732896	gene-agrp	agouti related neuropeptide	agrp
+chr13	24734425	24737175	gene-LOC111843547	chymotrypsin A-like	LOC111843547	ctrg
+chr13	24744019	24747228	gene-LOC111843498	CCAAT/enhancer-binding protein gamma-like	LOC111843498	cebpg
+chr13	24751002	24754582	gene-LOC111843507	CCAAT/enhancer-binding protein alpha-like	LOC111843507	cebpa
+chr13	24785942	24797206	gene-LOC111843506	asc-type amino acid transporter 1-like	LOC111843506	slc7a10
+chr13	24804658	24810415	gene-LOC111843516	E3 ubiquitin-protein ligase RNF182-like	LOC111843516	RNF182
+chr13	24808729	24815989	gene-LOC111843559	"b(0,+)-type amino acid transporter 1-like"	LOC111843559	SLC7A9
+chr13	24817462	24841685	gene-tdrd12	tudor domain containing 12	tdrd12
+chr16	10769370	10858593	gene-LOC111845409	contactin-associated protein-like 5	LOC111845409	cntnap5
+chr16	10976557	11000822	gene-LOC111845410	glycophorin-C-like	LOC111845410	gypc
+chr16	10983825	10983897	gene-trnav-uac-69	transfer RNA valine (anticodon UAC)	trnav-uac
+chr16	11027152	11045978	gene-ndufa10	NADH:ubiquinone oxidoreductase subunit A10	ndufa10
+chr17	11643493	11656373	gene-shkbp1	SH3KBP1 binding protein 1	shkbp1
+chr17	11657793	11659724	gene-snrnp35	small nuclear ribonucleoprotein 35 (U11/U12)	snrnp35
+chr17	11668767	11744989	gene-sptbn4b	"spectrin, beta, non-erythrocytic 4b"	sptbn4b
+chr17	11596040	11602009	gene-foxa3	"forkhead box A3"	foxa3
+chr24	8541497	8578770	gene-LOC111842864	uncharacterized LOC111842864	LOC111842864
+chr24	8644763	8651782	gene-naa40	"N-alpha-acetyltransferase 40, NatD catalytic subunit"	naa40
